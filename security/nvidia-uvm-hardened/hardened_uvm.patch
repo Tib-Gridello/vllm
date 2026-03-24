@@ -1,0 +1,67 @@
+--- a/kernel-open/nvidia-uvm/uvm.c
++++ b/kernel-open/nvidia-uvm/uvm.c
+@@ -1,3 +1,5 @@
++// vLLM hardened nvidia_uvm: blocks dangerous ioctls at module level
++
+ /*******************************************************************************
+     Copyright (c) 2015-2023 NVIDIA Corporation
+
+@@ -XXX,6 +XXX,60 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+     // ... existing code ...
+
++#ifdef UVM_HARDENED_MODE
++    // =========================================================================
++    // vLLM HARDENED MODE: Block dangerous ioctls before they reach handlers.
++    //
++    // These ioctls are NOT needed for basic CUDA operation (cuMemAlloc,
++    // cuLaunchKernel, cuMemCreate/cuMemMap VMM APIs). vLLM does not use
++    // cudaMallocManaged or any managed memory features.
++    //
++    // Blocked categories:
++    //   - UVM_TOOLS_*: Debug/profiling tools, includes arbitrary memory R/W
++    //   - UVM_MIGRATE*: Page migration (managed memory only)
++    //   - UVM_SET/UNSET_PREFERRED_LOCATION: Migration policy
++    //   - UVM_SET/UNSET_ACCESSED_BY: Access tracking for migration
++    //   - UVM_*_READ_DUPLICATION: Memory replication
++    //   - UVM_*_MIGRATION_RANGE_GROUPS: Migration control
++    //   - UVM_MAP_DYNAMIC_PARALLELISM_REGION: CUDA dynamic parallelism
++    //   - UVM_POPULATE_PAGEABLE: Pageable memory population
++    // =========================================================================
++    switch (cmd) {
++        // === CRITICAL: Arbitrary process memory access ===
++        case UVM_TOOLS_READ_PROCESS_MEMORY:
++        case UVM_TOOLS_WRITE_PROCESS_MEMORY:
++        // === Tools/Debug/Profiling ===
++        case UVM_TOOLS_INIT_EVENT_TRACKER:
++        case UVM_TOOLS_SET_NOTIFICATION_THRESHOLD:
++        case UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS:
++        case UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS:
++        case UVM_TOOLS_ENABLE_COUNTERS:
++        case UVM_TOOLS_DISABLE_COUNTERS:
++        case UVM_TOOLS_GET_PROCESSOR_UUID_TABLE:
++        case UVM_TOOLS_FLUSH_EVENTS:
++        case UVM_TOOLS_INIT_EVENT_TRACKER_V2:
++        case UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2:
++        // === Page Migration (managed memory only) ===
++        case UVM_MIGRATE:
++        case UVM_MIGRATE_RANGE_GROUP:
++        // === Migration Policy ===
++        case UVM_SET_PREFERRED_LOCATION:
++        case UVM_UNSET_PREFERRED_LOCATION:
++        case UVM_SET_ACCESSED_BY:
++        case UVM_UNSET_ACCESSED_BY:
++        case UVM_ENABLE_READ_DUPLICATION:
++        case UVM_DISABLE_READ_DUPLICATION:
++        case UVM_PREVENT_MIGRATION_RANGE_GROUPS:
++        case UVM_ALLOW_MIGRATION_RANGE_GROUPS:
++        // === Misc unnecessary ===
++        case UVM_MAP_DYNAMIC_PARALLELISM_REGION:
++        case UVM_POPULATE_PAGEABLE:
++        case UVM_CLEAR_ALL_ACCESS_COUNTERS:
++        case UVM_DISCARD:
++            pr_debug_ratelimited("nvidia-uvm-hardened: blocked ioctl %u\n", cmd);
++            return -ENOSYS;
++    }
++#endif // UVM_HARDENED_MODE
++
+     // ... existing dispatch continues below ...

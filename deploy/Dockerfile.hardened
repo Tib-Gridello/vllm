@@ -1,0 +1,71 @@
+# vLLM Hardened Container — Synacktiv-style least-privilege deployment
+#
+# Mirrors the security architecture from:
+# https://www.synacktiv.com/publications/grand-saut-dans-le-deploiement-sur-site-dun-serveur-llm-a-moindres-privileges
+#
+# Key security features:
+# - seccomp profile blocking 26 dangerous nvidia_uvm ioctls
+# - Dropped capabilities (no SYS_ADMIN, SYS_MODULE, SYS_PTRACE)
+# - Non-root user inside container
+# - Read-only rootfs where possible
+# - No network stack (Unix socket only for API)
+# - Vulkan backend option for nvidia_uvm elimination
+#
+# Build:
+#   docker build -f Dockerfile.hardened -t vllm-hardened:latest .
+#
+# Run (hybrid mode — cuBLAS + seccomp hardened):
+#   docker run --gpus all \
+#     --security-opt seccomp=../vllm/security/uvm_seccomp_profile.json \
+#     --security-opt no-new-privileges \
+#     --cap-drop ALL --cap-add SYS_NICE \
+#     -v /path/to/models:/models:ro \
+#     -v /tmp/vllm-sock:/run/vllm \
+#     -e MODEL_NAME=facebook/opt-125m \
+#     vllm-hardened:latest
+
+ARG VLLM_TAG=v0.17.0
+FROM vllm/vllm-openai:${VLLM_TAG}
+
+# Install Vulkan runtime (for future pure Vulkan mode)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libvulkan1 \
+        vulkan-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy our security profiles and Vulkan backend
+COPY vllm/security/uvm_seccomp_profile.json /etc/vllm/uvm_seccomp_profile.json
+COPY vllm/security/README.md /etc/vllm/security-README.md
+
+# Copy the Vulkan backend Python code
+COPY vllm/vllm/vulkan/ /opt/vllm/vllm/vulkan/
+
+# Create non-root user for the LLM service
+RUN groupadd -g 1000 vllm && \
+    useradd -u 1000 -g vllm -m -s /bin/bash vllm && \
+    mkdir -p /models /run/vllm /home/vllm/.cache && \
+    chown -R vllm:vllm /models /run/vllm /home/vllm/.cache
+
+# Default environment
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    VLLM_LOGGING_LEVEL=INFO \
+    HF_HOME=/home/vllm/.cache/huggingface \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_VISIBLE_DEVICES=all
+
+# Entrypoint script that handles model download + serving
+COPY deploy/entrypoint-hardened.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Switch to non-root user
+USER vllm
+WORKDIR /home/vllm
+
+# Expose Unix socket directory (not TCP port)
+VOLUME ["/run/vllm"]
+
+# Health check via the Unix socket
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -sf --unix-socket /run/vllm/vllm.sock http://localhost/health || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]

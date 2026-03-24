@@ -1,0 +1,188 @@
+{
+    "comment": "vLLM hardened seccomp profile: blocks dangerous nvidia_uvm ioctls while allowing required CUDA operations. See security/README.md for details.",
+    "defaultAction": "SCMP_ACT_ALLOW",
+    "syscalls": [
+        {
+            "comment": "UVM_TOOLS_READ_PROCESS_MEMORY (62) - CRITICAL: arbitrary process memory read",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 62, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_WRITE_PROCESS_MEMORY (63) - CRITICAL: arbitrary process memory write",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 63, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_INIT_EVENT_TRACKER (56) - debug event tracking",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 56, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_SET_NOTIFICATION_THRESHOLD (57) - debug notifications",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 57, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS (58) - debug events",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 58, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS (59) - debug events",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 59, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_ENABLE_COUNTERS (60) - performance counters",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 60, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_DISABLE_COUNTERS (61) - performance counters",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 61, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_GET_PROCESSOR_UUID_TABLE (64) - info disclosure",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 64, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_FLUSH_EVENTS (67) - debug events",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 67, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_INIT_EVENT_TRACKER_V2 (76) - debug event tracking v2",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 76, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2 (77) - info disclosure v2",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 77, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_MIGRATE (51) - page migration between CPU/GPU",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 51, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_MIGRATE_RANGE_GROUP (53) - group page migration",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 53, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_SET_PREFERRED_LOCATION (42) - managed memory placement",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 42, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_UNSET_PREFERRED_LOCATION (43) - managed memory placement",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 43, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_ENABLE_READ_DUPLICATION (44) - memory replication",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 44, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_DISABLE_READ_DUPLICATION (45) - memory replication",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 45, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_SET_ACCESSED_BY (46) - access tracking",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 46, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_UNSET_ACCESSED_BY (47) - access tracking",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 47, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_PREVENT_MIGRATION_RANGE_GROUPS (40) - migration control",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 40, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_ALLOW_MIGRATION_RANGE_GROUPS (41) - migration control",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 41, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_MAP_DYNAMIC_PARALLELISM_REGION (65) - dynamic parallelism",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 65, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_POPULATE_PAGEABLE (71) - pageable memory population",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 71, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_CLEAR_ALL_ACCESS_COUNTERS (79) - access counter clearing",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 79, "op": "SCMP_CMP_EQ"}]
+        },
+        {
+            "comment": "UVM_DISCARD (80) - memory discard",
+            "names": ["ioctl"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 38,
+            "args": [{"index": 1, "value": 80, "op": "SCMP_CMP_EQ"}]
+        }
+    ]
+}
