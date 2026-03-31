@@ -1446,6 +1446,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "flashinfer-trtllm",
             "flashinfer-cutlass",
             "cutlass",
+            "fp8-compute",
             "marlin",
         ],
     ),

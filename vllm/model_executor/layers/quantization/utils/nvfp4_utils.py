@@ -32,8 +32,23 @@ class NvFp4LinearBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer-trtllm"
     FLASHINFER_CUDNN = "flashinfer-cudnn"
     FBGEMM = "fbgemm"
+    FP8_COMPUTE = "fp8-compute"
     MARLIN = "marlin"
     EMULATION = "emulation"
+
+
+def _is_hopper_without_native_fp4() -> bool:
+    """Check if we're on Hopper (SM_90) without native FP4 tensor core support.
+    On such GPUs, converting NVFP4 weights to FP8 and using native FP8 tensor
+    cores (3,958 TFLOPS) is much faster than the Marlin FP4 fallback that
+    dequantizes to FP16 and uses FP16 tensor cores (989 TFLOPS)."""
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+    return (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+        and not cutlass_fp4_supported()
+        and is_deep_gemm_supported()
+    )
 
 
 def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
@@ -68,6 +83,8 @@ def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
             backend = NvFp4LinearBackend.FLASHINFER_CUTLASS
         elif cutlass_fp4_supported():
             backend = NvFp4LinearBackend.VLLM_CUTLASS
+        elif _is_hopper_without_native_fp4():
+            backend = NvFp4LinearBackend.FP8_COMPUTE
         elif is_fp4_marlin_supported():
             backend = NvFp4LinearBackend.MARLIN
     else:
@@ -86,6 +103,11 @@ def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
         )
     elif backend == NvFp4LinearBackend.VLLM_CUTLASS:
         assert cutlass_fp4_supported(), f"Cutlass is required for {backend}"
+    elif backend == NvFp4LinearBackend.FP8_COMPUTE:
+        from vllm.utils.deep_gemm import is_deep_gemm_supported
+        assert is_deep_gemm_supported(), (
+            f"{backend} requires DeepGEMM support (Hopper/Blackwell GPU)"
+        )
     elif backend == NvFp4LinearBackend.MARLIN:
         assert is_fp4_marlin_supported(), f"Marlin is required for {backend}"
     elif backend is None:
@@ -139,6 +161,52 @@ def prepare_weights_for_nvfp4_fbgemm(
     return weight, swizzled_weight_scale
 
 
+def convert_nvfp4_weight_to_fp8_block(
+    weight_fp4: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    block_size: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert packed NVFP4 weight to FP8 block-quantized weight.
+
+    Dequantizes FP4 weights to BF16, then re-quantizes to FP8 with block
+    scaling suitable for DeepGEMM / CUTLASS FP8 kernels on Hopper.
+
+    Args:
+        weight_fp4: Packed uint8 FP4 weights, shape (N, K/2).
+        weight_scale: Per-block FP8-E4M3 scales, shape (N, K/group_size).
+        weight_global_scale: Scalar FP32 global scale.
+        block_size: FP8 block quantization shape, default [128, 128].
+
+    Returns:
+        (weight_fp8, weight_scale_fp32) ready for DeepGEMM.
+    """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+    )
+    from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+    if block_size is None:
+        block_size = [128, 128]
+
+    # Dequantize FP4 → BF16 (handles swizzled scale layout + global scale)
+    weight_bf16 = dequantize_to_dtype(
+        weight_fp4.view(torch.uint8),
+        weight_scale,
+        weight_global_scale,
+        torch.bfloat16,
+        weight_fp4.device,
+    )
+
+    # Transpose to NT layout (K, N) before block quantization so scale
+    # orientation matches what DeepGEMM post-processing expects.
+    weight_fp8, weight_fp8_scale = per_block_cast_to_fp8(
+        weight_bf16.t().contiguous(), block_size
+    )
+
+    return weight_fp8, weight_fp8_scale
+
+
 def convert_to_nvfp4_linear_kernel_format(
     backend: NvFp4LinearBackend,
     layer: torch.nn.Module,
@@ -152,7 +220,54 @@ def convert_to_nvfp4_linear_kernel_format(
     # Default to no padding
     layer.weights_padding_cols = 0
 
-    if backend == NvFp4LinearBackend.MARLIN:
+    if backend == NvFp4LinearBackend.FP8_COMPUTE:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            maybe_post_process_fp8_weight_block,
+        )
+        logger.info_once(
+            "Converting NVFP4 weights to FP8 for native Hopper tensor core "
+            "compute (4x faster than Marlin FP4 fallback)."
+        )
+        weight_fp8, weight_fp8_scale = convert_nvfp4_weight_to_fp8_block(
+            layer.weight.data, layer.weight_scale.data,
+            layer.weight_global_scale,
+        )
+        # Weight is already in NT layout (transposed inside convert function)
+        layer.weight = torch.nn.Parameter(
+            weight_fp8, requires_grad=False
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            weight_fp8_scale, requires_grad=False
+        )
+        layer.weight_block_size = [128, 128]
+        layer.orig_dtype = torch.bfloat16
+        # Only apply DeepGEMM post-processing if dimensions are compatible
+        from vllm.utils.deep_gemm import should_use_deepgemm_for_fp8_linear
+        if should_use_deepgemm_for_fp8_linear(torch.bfloat16, layer.weight):
+            maybe_post_process_fp8_weight_block(layer)
+        # Create FP8 linear op for runtime dispatch
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            W8A8BlockFp8LinearOp,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            GroupShape,
+        )
+        layer._fp8_linear_op = W8A8BlockFp8LinearOp(
+            weight_group_shape=GroupShape(128, 128),
+            act_quant_group_shape=GroupShape(1, 128),
+        )
+        # Clean up FP4-specific attributes
+        if hasattr(layer, "weight_scale"):
+            del layer.weight_scale
+        if hasattr(layer, "weight_global_scale"):
+            del layer.weight_global_scale
+        if hasattr(layer, "alpha"):
+            del layer.alpha
+        if hasattr(layer, "input_global_scale_inv"):
+            del layer.input_global_scale_inv
+        if hasattr(layer, "input_global_scale"):
+            del layer.input_global_scale
+    elif backend == NvFp4LinearBackend.MARLIN:
         logger.warning_once(
             "Your GPU does not have native support for FP4 computation but "
             "FP4 quantization is being used. Weight-only FP4 compression "
@@ -194,6 +309,16 @@ def apply_nvfp4_linear(
     """
     Apply NVFP4 linear transformation using the specified backend.
     """
+    if backend == NvFp4LinearBackend.FP8_COMPUTE:
+        # Weights were converted to FP8 at load time; use FP8 GEMM path
+        return layer._fp8_linear_op.apply(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale_inv,
+            input_scale=None,
+            bias=bias,
+        )
+
     weight = layer.weight
     weight_scale = layer.weight_scale
     weight_global_scale = layer.weight_global_scale

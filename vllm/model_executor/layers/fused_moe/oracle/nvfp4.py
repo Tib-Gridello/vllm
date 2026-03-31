@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
+    fp8_w8a8_moe_quant_config,
     nvfp4_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
 )
@@ -39,6 +40,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     VLLM_CUTLASS = "VLLM_CUTLASS"
+    FP8_COMPUTE = "FP8_COMPUTE"
     MARLIN = "MARLIN"
 
 
@@ -99,6 +101,13 @@ def backend_to_kernel_cls(
 
         return [CutlassExpertsFp4]
 
+    elif backend == NvFp4MoeBackend.FP8_COMPUTE:
+        from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
+            TritonOrDeepGemmExperts,
+        )
+
+        return [TritonOrDeepGemmExperts]
+
     elif backend == NvFp4MoeBackend.MARLIN:
         from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
             MarlinExperts,
@@ -142,6 +151,7 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.VLLM_CUTLASS,
+        NvFp4MoeBackend.FP8_COMPUTE,
         NvFp4MoeBackend.MARLIN,
     ]
 
@@ -241,6 +251,17 @@ def select_nvfp4_moe_backend(
             backend, config, weight_key, activation_key, activation_format
         )
 
+    # On Hopper without native FP4, force FP8_COMPUTE for MoE.
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+        _is_hopper_without_native_fp4,
+    )
+    if _is_hopper_without_native_fp4():
+        from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
+            TritonOrDeepGemmExperts,
+        )
+        logger.info_once("Using FP8_COMPUTE MoE backend on Hopper (4x faster).")
+        return NvFp4MoeBackend.FP8_COMPUTE, TritonOrDeepGemmExperts
+
     # Select kernels in order of backend.
     for backend in AVAILABLE_BACKENDS:
         for k_cls in backend_to_kernel_cls(backend):
@@ -260,6 +281,67 @@ def select_nvfp4_moe_backend(
 
     raise NotImplementedError(
         "No NvFp4 MoE backend supports the deployment configuration."
+    )
+
+
+def _convert_nvfp4_moe_to_fp8_compute(
+    layer: torch.nn.Module,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_scale_2: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_scale_2: torch.Tensor,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None,
+    torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None,
+]:
+    """Convert NVFP4 MoE expert weights to FP8 block-quantized format.
+
+    Dequantizes each expert's FP4 weights to BF16, then re-quantizes to FP8
+    with [128, 128] block scaling for DeepGEMM / Triton FP8 MoE kernels.
+    """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+    )
+    from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+    logger.info_once(
+        "Converting NVFP4 MoE expert weights to FP8 for native Hopper "
+        "tensor core compute (4x faster than Marlin FP4 fallback)."
+    )
+
+    block_size = [128, 128]
+
+    def _convert_expert_weights(
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        global_scales: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert (E, N, K/2) FP4 packed → (E, N, K) FP8 + block scales."""
+        num_experts = weights.shape[0]
+        fp8_list = []
+        scale_list = []
+        for e in range(num_experts):
+            w_bf16 = dequantize_to_dtype(
+                weights[e].view(torch.uint8),
+                scales[e],
+                global_scales[e] if global_scales.dim() > 0 else global_scales,
+                torch.bfloat16,
+                weights.device,
+            )
+            w_fp8, w_scale = per_block_cast_to_fp8(w_bf16, block_size)
+            fp8_list.append(w_fp8)
+            scale_list.append(w_scale)
+        return torch.stack(fp8_list), torch.stack(scale_list)
+
+    w13_fp8, w13_fp8_scale = _convert_expert_weights(w13, w13_scale, w13_scale_2)
+    w2_fp8, w2_fp8_scale = _convert_expert_weights(w2, w2_scale, w2_scale_2)
+
+    # Return with no activation scales or global scales (dynamic quant at runtime)
+    return (
+        w13_fp8, w13_fp8_scale, None, None,
+        w2_fp8, w2_fp8_scale, None, None,
     )
 
 
@@ -311,6 +393,12 @@ def convert_to_nvfp4_moe_kernel_format(
             a2_scale=a2_scale,
             is_act_and_mul=is_act_and_mul,
         )
+    elif nvfp4_backend == NvFp4MoeBackend.FP8_COMPUTE:
+        w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, \
+            a2_scale = _convert_nvfp4_moe_to_fp8_compute(
+                layer, w13, w13_scale, w13_scale_2,
+                w2, w2_scale, w2_scale_2,
+            )
     elif nvfp4_backend == NvFp4MoeBackend.MARLIN:
         a13_scale = None
         a2_scale = None
@@ -355,6 +443,13 @@ def make_nvfp4_moe_quant_config(
     a13_scale: torch.Tensor,
     a2_scale: torch.Tensor,
 ) -> FusedMoEQuantConfig:
+    if backend == NvFp4MoeBackend.FP8_COMPUTE:
+        return fp8_w8a8_moe_quant_config(
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=[128, 128],
+        )
+
     if backend == NvFp4MoeBackend.MARLIN:
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,

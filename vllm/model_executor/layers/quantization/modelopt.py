@@ -73,6 +73,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     swizzle_mxfp8_scale,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    NvFp4LinearBackend,
     apply_nvfp4_linear,
     convert_to_nvfp4_linear_kernel_format,
     select_nvfp4_linear_backend,
@@ -1076,6 +1077,22 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         self.marlin_input_dtype = None
         self.backend = select_nvfp4_linear_backend()
 
+        # For FP8_COMPUTE backend, create the FP8 GEMM operator that will
+        # be used at runtime. This reuses the same W8A8 block FP8 path that
+        # native FP8 models use (DeepGEMM on Hopper, CUTLASS fallback).
+        self._fp8_linear_op = None
+        if self.backend == NvFp4LinearBackend.FP8_COMPUTE:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                W8A8BlockFp8LinearOp,
+            )
+            from vllm.model_executor.layers.quantization.utils.quant_utils import (
+                GroupShape,
+            )
+            self._fp8_linear_op = W8A8BlockFp8LinearOp(
+                weight_group_shape=GroupShape(128, 128),
+                act_quant_group_shape=GroupShape(1, 128),
+            )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1170,6 +1187,10 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # Convert layer to NVFP4 linear kernel format
         convert_to_nvfp4_linear_kernel_format(self.backend, layer)
 
+        # Attach FP8 linear op to layer for runtime dispatch
+        if self._fp8_linear_op is not None:
+            layer._fp8_linear_op = self._fp8_linear_op
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1198,12 +1219,27 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
-        # Select experts implementation.
-        self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
-            config=self.moe,
-            weight_key=kNvfp4Static,
-            activation_key=kNvfp4Dynamic,
+
+        # On Hopper without native FP4, convert weights to FP8 and use the
+        # FP8 MoE backend (DeepGEMM/Triton) for 4x faster tensor core compute.
+        from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+            _is_hopper_without_native_fp4,
         )
+        if _is_hopper_without_native_fp4():
+            from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+                NvFp4MoeBackend,
+                backend_to_kernel_cls,
+            )
+            self.nvfp4_backend = NvFp4MoeBackend.FP8_COMPUTE
+            kernel_classes = backend_to_kernel_cls(self.nvfp4_backend)
+            self.experts_cls = kernel_classes[0]
+        else:
+            # Select experts implementation via standard NVFP4 oracle.
+            self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
+                config=self.moe,
+                weight_key=kNvfp4Static,
+                activation_key=kNvfp4Dynamic,
+            )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
