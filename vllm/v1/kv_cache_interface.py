@@ -38,11 +38,17 @@ class KVQuantMode(IntEnum):
     FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
+    TURBOQUANT = 4  # TurboQuant: table-lookup + rotation + norm dequant
 
     @property
     def is_per_token_head(self) -> bool:
         """True for any per-token-head quantization mode."""
-        return self >= 2
+        return self in (KVQuantMode.INT8_PER_TOKEN_HEAD,
+                        KVQuantMode.FP8_PER_TOKEN_HEAD)
+
+    @property
+    def is_turboquant(self) -> bool:
+        return self == KVQuantMode.TURBOQUANT
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
@@ -51,6 +57,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
+    if kv_cache_dtype == "turboquant":
+        return KVQuantMode.TURBOQUANT
     if kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
@@ -128,6 +136,12 @@ class AttentionSpec(KVCacheSpec):
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
+        # TurboQuant norms: one float32 per (slot, head) stored as inline
+        # padding in the packed cache, same pattern as per-token-head scales.
+        if self.kv_quant_mode.is_turboquant:
+            real_page_size += (
+                2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
+            )
         if self.page_size_padded is not None:
             assert self.page_size_padded >= real_page_size
             return self.page_size_padded
@@ -135,11 +149,15 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        hs = self.head_size
+        # TurboQuant nibble-packs two 4-bit indices per byte.
+        if self.kv_quant_mode.is_turboquant:
+            hs = hs // 2
         return (
             2
             * self.block_size
             * self.num_kv_heads
-            * self.head_size
+            * hs
             * get_dtype_size(self.dtype)
         )
 
@@ -237,10 +255,16 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        hs_k = self.head_size
+        hs_v = self.head_size_v
+        # TurboQuant nibble-packs two 4-bit indices per byte.
+        if self.kv_quant_mode.is_turboquant:
+            hs_k = hs_k // 2
+            hs_v = hs_v // 2
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
+            * (hs_k + hs_v)
             * get_dtype_size(self.dtype)
         )
 

@@ -18,7 +18,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import (
+    get_dtype_size,
+    is_quantized_kv_cache,
+    is_turboquant_kv_cache,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -38,6 +42,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVQuantMode,
     get_kv_quant_mode,
     kv_cache_uses_per_token_head_scales,
 )
@@ -277,6 +282,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e5m2",
         "int8_per_token_head",
         "fp8_per_token_head",
+        "turboquant",
     ]
 
     @staticmethod
@@ -309,14 +315,17 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if is_turboquant_kv_cache(cache_dtype_str):
+            # Nibble-packed: head_size//2 data bytes + 4 padding for
+            # float32 norm (same inline pattern as per-token-head scales).
+            scale_pad = get_dtype_size(torch.float32)  # 4 uint8 = 1 float32
+            return (num_blocks, 2, block_size, num_kv_heads,
+                    head_size // 2 + scale_pad)
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
             # Pad head_size by sizeof(float32)/sizeof(cache_dtype) so
             # the per-head scale fits inline.  The backend extracts
             # data[:head_size] and scale[head_size:] via typed views.
-            from vllm.utils.torch_utils import (
-                STR_DTYPE_TO_TORCH_DTYPE,
-                get_dtype_size,
-            )
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
             scale_pad = get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
@@ -387,6 +396,69 @@ class TritonAttentionImpl(AttentionImpl):
     # Per-token-head quant: scale views carved from inline head padding.
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
+    # TurboQuant: norm views carved from inline head padding (same pattern).
+    _tq_k_norms: torch.Tensor | None = None
+    _tq_v_norms: torch.Tensor | None = None
+
+    def _ensure_tq_norm_caches(self, kv_cache: torch.Tensor) -> None:
+        """Extract per-head norm views from the padded packed dimension.
+
+        Same pattern as ``_ensure_scale_caches``.  The KV cache shape is
+        ``(num_blocks, 2, block_size, nkv, head_size//2 + 4)`` where the
+        last 4 uint8 bytes of each head hold one float32 norm.
+
+        Norm shape: ``(num_blocks, block_size, num_kv_heads)``
+        """
+        if self._tq_k_norms is not None:
+            return
+
+        num_blocks, _, block_size, nkv, padded_half_hs = kv_cache.shape
+        dtype_sz = kv_cache.element_size()  # 1 for uint8
+        scale_pad = get_dtype_size(torch.float32) // dtype_sz  # 4
+        half_hs = padded_half_hs - scale_pad
+
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor(
+            [], dtype=torch.float32, device=kv_cache.device
+        ).set_(raw)
+
+        kv_half_bytes = block_size * nkv * padded_half_hs * dtype_sz
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_half_hs * dtype_sz // 4
+        head_f32 = padded_half_hs * dtype_sz // 4
+        norm_off_f32 = half_hs * dtype_sz // 4
+
+        # K norms: kv_half=0
+        self._tq_k_norms = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=norm_off_f32,
+        )
+
+        # V norms: kv_half=1
+        v_base_f32 = kv_half_bytes // 4
+        self._tq_v_norms = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=v_base_f32 + norm_off_f32,
+        )
+
+        # Zero norms — critical because the profiling/warmup pass may have
+        # written stale data to these padding bytes.
+        self._tq_k_norms.fill_(0.0)
+        self._tq_v_norms.fill_(0.0)
+
+    def _reset_tq_norms(self) -> None:
+        """Invalidate norm views so they are recreated and re-zeroed.
+
+        The profiling pass may write stale data to the cache's norm padding.
+        Simply filling may not work if the storage changed, so we force view
+        recreation by setting the cached views to None.
+        """
+        self._tq_k_norms = None
+        self._tq_v_norms = None
 
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
@@ -495,6 +567,16 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        self._is_turboquant = (
+            self._kv_quant_mode == KVQuantMode.TURBOQUANT)
+        if self._is_turboquant:
+            import vllm.envs as envs
+            from vllm.v1.attention.ops.turboquant import TurboQuantCodebook
+            self._tq_codebook = TurboQuantCodebook(
+                n_bits=envs.VLLM_TURBOQUANT_BITS,
+                head_dim=head_size,
+                device="cpu",  # moved to GPU on first use
+            )
 
     def forward(
         self,
@@ -529,7 +611,10 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
         if attn_metadata is None:
-            # Profiling run.
+            # Profiling run.  Mark that norms need clearing before first
+            # real inference (warmup writes stale data to cache padding).
+            if self._is_turboquant:
+                self._tq_norms_dirty = True
             return output.fill_(0)
 
         assert attn_metadata.use_cascade is False
@@ -558,8 +643,30 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        # TurboQuant: packed uint8 indices with inline float32 norms.
+        tq_centroids = None
+        tq_rotation_signs = None
+        tq_k_norms = None
+        tq_v_norms = None
+        if self._is_turboquant:
+            self._ensure_tq_norm_caches(kv_cache)
+            key_cache, value_cache = kv_cache.unbind(1)
+            k_descale = None
+            v_descale = None
+            k_scale_cache = None
+            v_scale_cache = None
+            cb = self._tq_codebook
+            dev = key_cache.device
+            tq_centroids = cb.centroids.to(dev, non_blocking=True)
+            tq_rotation_signs = None  # not used — Q is rotated instead
+            tq_k_norms = self._tq_k_norms
+            tq_v_norms = self._tq_v_norms
+            # Rotate Q by R: q_rot = R @ q, in batch = q @ R^T
+            from vllm.v1.attention.ops.turboquant import rotate_query
+            R = cb.rotation_matrix.to(dev, non_blocking=True)
+            query = rotate_query(query[:num_actual_tokens], R)
         # Per-token-head quantized KV cache: use separate scale caches.
-        if self._is_per_token_head_quant:
+        elif self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
             if key_cache.dtype == torch.uint8:
@@ -602,8 +709,10 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # For TQ, query was already rotated and sliced above
+        q_for_attn = query if self._is_turboquant else query[:num_actual_tokens]
         unified_attention(
-            q=query[:num_actual_tokens],
+            q=q_for_attn,
             k=key_cache,
             v=value_cache,
             out=output[:num_actual_tokens],
@@ -632,7 +741,19 @@ class TritonAttentionImpl(AttentionImpl):
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
+            tq_centroids=tq_centroids,
+            tq_rotation_signs=tq_rotation_signs,
+            tq_k_norms=tq_k_norms,
+            tq_v_norms=tq_v_norms,
         )
+
+        # TQ: inverse-rotate attention output (V was in rotated space)
+        # R^T @ output, in batch = output @ R
+        if self._is_turboquant:
+            from vllm.v1.attention.ops.turboquant import inverse_rotate_output
+            R = self._tq_codebook.rotation_matrix.to(output.device)
+            out_slice = output[:num_actual_tokens]
+            out_slice.copy_(inverse_rotate_output(out_slice, R))
 
         return output
 
@@ -695,6 +816,24 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
+        if self._is_turboquant:
+            # Invalidate norm views BEFORE recreating if dirty (warmup wrote
+            # stale data; views may point to old storage).
+            if getattr(self, '_tq_norms_dirty', False):
+                self._tq_norms_dirty = False
+                self._reset_tq_norms()  # sets _tq_k_norms = None
+            self._ensure_tq_norm_caches(kv_cache)  # recreates + fills 0
+            key_cache, value_cache = kv_cache.unbind(1)
+            from vllm.v1.attention.ops.turboquant import (
+                turboquant_reshape_and_cache,
+            )
+            turboquant_reshape_and_cache(
+                key, value,
+                key_cache, value_cache,
+                self._tq_k_norms, self._tq_v_norms,
+                slot_mapping, self._tq_codebook.to(key.device),
+            )
+            return
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
