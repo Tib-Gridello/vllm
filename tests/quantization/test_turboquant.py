@@ -1036,5 +1036,536 @@ class TestDequantPaged:
                             f"got {actual_norm:.4f}")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestRotateQuery:
+    """Test rotate_query / inverse_rotate_output on GPU."""
+
+    @pytest.fixture
+    def codebook(self):
+        return TurboQuantCodebook(n_bits=6, head_dim=128, device="cuda",
+                                   qjl=True)
+
+    def test_rotate_preserves_norm(self, codebook):
+        """rotate_query should preserve L2 norms."""
+        from vllm.v1.attention.ops.turboquant import rotate_query
+
+        torch.manual_seed(42)
+        q = torch.randn(10, 128, dtype=torch.bfloat16, device="cuda")
+        norms_before = q.float().norm(dim=-1)
+        q_rot = rotate_query(q, codebook.rotation_matrix_T)
+        norms_after = q_rot.float().norm(dim=-1)
+        torch.testing.assert_close(norms_before, norms_after,
+                                    atol=1e-3, rtol=1e-3)
+
+    def test_rotate_inverse_roundtrip(self, codebook):
+        """rotate_query then inverse_rotate_output should be near-identity."""
+        from vllm.v1.attention.ops.turboquant import (
+            inverse_rotate_output,
+            rotate_query,
+        )
+
+        torch.manual_seed(42)
+        q = torch.randn(10, 4, 128, dtype=torch.bfloat16, device="cuda")
+        q_rot = rotate_query(q, codebook.rotation_matrix_T)
+        q_back = inverse_rotate_output(q_rot, codebook.rotation_matrix)
+        torch.testing.assert_close(q.float(), q_back.float(),
+                                    atol=5e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_rotate_dtype_preservation(self, codebook, dtype):
+        """Output dtype should match input dtype."""
+        from vllm.v1.attention.ops.turboquant import rotate_query
+
+        q = torch.randn(10, 128, dtype=dtype, device="cuda")
+        q_rot = rotate_query(q, codebook.rotation_matrix_T)
+        assert q_rot.dtype == dtype, (
+            f"Expected {dtype}, got {q_rot.dtype}")
+
+    @pytest.mark.parametrize("shape", [
+        (10, 128),
+        (10, 4, 128),
+        (10, 4, 32, 128),
+    ])
+    def test_rotate_batch_shapes(self, codebook, shape):
+        """rotate_query should work with various batch dimensions."""
+        from vllm.v1.attention.ops.turboquant import rotate_query
+
+        torch.manual_seed(42)
+        q = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
+        q_rot = rotate_query(q, codebook.rotation_matrix_T)
+        assert q_rot.shape == shape, (
+            f"Expected shape {shape}, got {q_rot.shape}")
+        # Norms should still be preserved
+        norms_before = q.float().reshape(-1, 128).norm(dim=-1)
+        norms_after = q_rot.float().reshape(-1, 128).norm(dim=-1)
+        torch.testing.assert_close(norms_before, norms_after,
+                                    atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestIncrementalDequant:
+    """Test incremental (dirty_blocks) dequant on GPU."""
+
+    @pytest.fixture
+    def codebook(self):
+        return TurboQuantCodebook(n_bits=6, head_dim=128, device="cuda",
+                                   qjl=True)
+
+    def _build_paged_cache(self, codebook, num_seqs=4, seq_len=64,
+                            block_size=16, nkv=4):
+        """Build a TQ paged cache (same helper as TestDequantPaged)."""
+        head_dim = codebook.head_dim
+        num_blocks_per_seq = (seq_len + block_size - 1) // block_size
+        total_blocks = num_seqs * num_blocks_per_seq + 4
+
+        data_dim = head_dim if codebook.byte_mode else head_dim // 2
+        scale_pad = 4
+        if codebook.qjl:
+            padded_dim = data_dim + scale_pad + sign_bytes_padded(
+                head_dim) + scale_pad
+        else:
+            padded_dim = data_dim + scale_pad
+
+        kv_cache = torch.zeros(
+            (total_blocks, 2, block_size, nkv, padded_dim),
+            dtype=torch.uint8, device="cuda")
+
+        block_table = torch.zeros(
+            (num_seqs, num_blocks_per_seq), dtype=torch.int32, device="cuda")
+        for s in range(num_seqs):
+            for p in range(num_blocks_per_seq):
+                block_table[s, p] = s * num_blocks_per_seq + p
+
+        seq_lens = torch.full(
+            (num_seqs,), seq_len, dtype=torch.int32, device="cuda")
+
+        from vllm.v1.attention.ops.turboquant import (
+            turboquant_reshape_and_cache,
+        )
+
+        total_tokens = num_seqs * seq_len
+        slot_mapping = torch.zeros(total_tokens, dtype=torch.long,
+                                    device="cuda")
+        for s in range(num_seqs):
+            for i in range(seq_len):
+                blk = block_table[s, i // block_size].item()
+                off = i % block_size
+                slot_mapping[s * seq_len + i] = blk * block_size + off
+
+        key = torch.randn(
+            total_tokens, nkv, head_dim, dtype=torch.bfloat16, device="cuda")
+        value = torch.randn(
+            total_tokens, nkv, head_dim, dtype=torch.bfloat16, device="cuda")
+
+        key_cache, value_cache = kv_cache.unbind(1)
+        dtype_sz = 1
+        kv_half_bytes = block_size * nkv * padded_dim * dtype_sz
+        idx_data_bytes = head_dim if codebook.byte_mode else head_dim // 2
+
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor(
+            [], dtype=torch.float32, device="cuda").set_(raw)
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_dim // 4
+        head_f32 = padded_dim // 4
+        norm_off_f32 = idx_data_bytes // 4
+
+        k_norms = torch.as_strided(
+            base_f32, size=(total_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=norm_off_f32)
+        v_base_f32 = kv_half_bytes // 4
+        v_norms = torch.as_strided(
+            base_f32, size=(total_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=v_base_f32 + norm_off_f32)
+        k_norms.fill_(0.0)
+        v_norms.fill_(0.0)
+
+        k_signs = v_signs = k_res_scales = v_res_scales = None
+        if codebook.qjl:
+            sbytes = sign_bytes_padded(head_dim)
+            sign_byte_off = idx_data_bytes + 4
+            base_u8 = torch.tensor(
+                [], dtype=torch.uint8, device="cuda").set_(raw)
+            full_block_u8 = 2 * kv_half_bytes
+            slot_u8 = nkv * padded_dim
+            head_u8 = padded_dim
+
+            k_signs = torch.as_strided(
+                base_u8, size=(total_blocks, block_size, nkv, sbytes),
+                stride=(full_block_u8, slot_u8, head_u8, 1),
+                storage_offset=sign_byte_off)
+            v_signs = torch.as_strided(
+                base_u8, size=(total_blocks, block_size, nkv, sbytes),
+                stride=(full_block_u8, slot_u8, head_u8, 1),
+                storage_offset=kv_half_bytes + sign_byte_off)
+            k_signs.fill_(0)
+            v_signs.fill_(0)
+
+            res_scale_off = (idx_data_bytes + 4 + sbytes) // 4
+            k_res_scales = torch.as_strided(
+                base_f32, size=(total_blocks, block_size, nkv),
+                stride=(full_block_f32, slot_f32, head_f32),
+                storage_offset=res_scale_off)
+            v_res_scales = torch.as_strided(
+                base_f32, size=(total_blocks, block_size, nkv),
+                stride=(full_block_f32, slot_f32, head_f32),
+                storage_offset=v_base_f32 + res_scale_off)
+            k_res_scales.fill_(0.0)
+            v_res_scales.fill_(0.0)
+
+        turboquant_reshape_and_cache(
+            key, value, key_cache, value_cache,
+            k_norms, v_norms, slot_mapping, codebook,
+            k_signs=k_signs, v_signs=v_signs,
+            k_res_scales=k_res_scales, v_res_scales=v_res_scales,
+        )
+
+        return dict(
+            kv_cache=kv_cache,
+            key_cache=key_cache, value_cache=value_cache,
+            k_norms=k_norms, v_norms=v_norms,
+            k_signs=k_signs, v_signs=v_signs,
+            k_res_scales=k_res_scales, v_res_scales=v_res_scales,
+            block_table=block_table, seq_lens=seq_lens,
+            codebook=codebook, key=key, value=value,
+            block_size=block_size, nkv=nkv,
+            total_blocks=total_blocks,
+            num_seqs=num_seqs, seq_len=seq_len,
+        )
+
+    def _run_dequant(self, cache_data, dirty_blocks=None):
+        """Run turboquant_dequant_paged and return staging K/V."""
+        from vllm.v1.attention.ops.turboquant import turboquant_dequant_paged
+
+        cd = cache_data
+        cb = cd['codebook']
+        num_seqs = cd['num_seqs']
+        max_bps = cd['block_table'].shape[1]
+        staging_blocks = num_seqs * max_bps
+        head_dim = cb.head_dim
+        nkv = cd['nkv']
+        block_size = cd['block_size']
+
+        staging_key = torch.zeros(
+            (staging_blocks, block_size, nkv, head_dim),
+            dtype=torch.bfloat16, device="cuda")
+        staging_val = torch.zeros(
+            (staging_blocks, block_size, nkv, head_dim),
+            dtype=torch.bfloat16, device="cuda")
+
+        turboquant_dequant_paged(
+            cd['key_cache'], cd['value_cache'],
+            cd['k_norms'], cd['v_norms'],
+            staging_key, staging_val,
+            cb, cd['block_table'], cd['seq_lens'], max_bps,
+            k_signs=cd['k_signs'], v_signs=cd['v_signs'],
+            k_res_scales=cd['k_res_scales'],
+            v_res_scales=cd['v_res_scales'],
+            dirty_blocks=dirty_blocks,
+        )
+        return staging_key, staging_val
+
+    def test_full_dequant_matches_reference(self, codebook):
+        """Full dequant (dirty_blocks=None) should match reference."""
+        torch.manual_seed(42)
+        cd = self._build_paged_cache(codebook, num_seqs=2,
+                                      seq_len=32, block_size=16, nkv=2)
+        # Full dequant (no dirty_blocks)
+        staging_key_full, staging_val_full = self._run_dequant(cd)
+
+        # Compare against a second full dequant to confirm determinism
+        staging_key_2, staging_val_2 = self._run_dequant(cd)
+        torch.testing.assert_close(staging_key_full, staging_key_2)
+        torch.testing.assert_close(staging_val_full, staging_val_2)
+
+        # Non-empty slots should have non-zero values
+        assert staging_key_full.abs().sum() > 0
+        assert staging_val_full.abs().sum() > 0
+
+    def test_selective_dequant_updates_dirty_only(self, codebook):
+        """Pass dirty_blocks with some True, verify only those staging
+        positions change."""
+        torch.manual_seed(42)
+        cd = self._build_paged_cache(codebook, num_seqs=2,
+                                      seq_len=32, block_size=16, nkv=2)
+
+        total_blocks = cd['total_blocks']
+
+        # First do a full dequant to populate staging
+        staging_key_full, staging_val_full = self._run_dequant(cd)
+
+        # Now create dirty_blocks where only some physical blocks are dirty
+        dirty_blocks = torch.zeros(total_blocks, dtype=torch.bool,
+                                    device="cuda")
+        # Mark only blocks 0 and 2 as dirty
+        dirty_blocks[0] = True
+        dirty_blocks[2] = True
+
+        # Start with zeroed staging buffers
+        staging_key_inc, staging_val_inc = self._run_dequant(
+            cd, dirty_blocks=dirty_blocks)
+
+        # For dirty physical blocks (0, 2), the staging output should match
+        # the full dequant output
+        max_bps = cd['block_table'].shape[1]
+        num_seqs = cd['num_seqs']
+        for s in range(num_seqs):
+            for p in range(max_bps):
+                phys = cd['block_table'][s, p].item()
+                staging_blk = s * max_bps + p
+                if dirty_blocks[phys]:
+                    # Dirty block: should be decompressed
+                    torch.testing.assert_close(
+                        staging_key_inc[staging_blk].float(),
+                        staging_key_full[staging_blk].float(),
+                        atol=0.02, rtol=0.01)
+                    torch.testing.assert_close(
+                        staging_val_inc[staging_blk].float(),
+                        staging_val_full[staging_blk].float(),
+                        atol=0.02, rtol=0.01)
+                else:
+                    # Clean block: staging should remain zero
+                    assert (staging_key_inc[staging_blk] == 0).all(), (
+                        f"Clean block s={s} p={p} phys={phys} "
+                        "should remain zero")
+                    assert (staging_val_inc[staging_blk] == 0).all(), (
+                        f"Clean block s={s} p={p} phys={phys} "
+                        "should remain zero")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestEndToEndAttention:
+    """Test full TQ attention pipeline vs bf16 reference."""
+
+    def _build_paged_cache(self, codebook, num_seqs=2, seq_len=32,
+                            block_size=16, nkv=4):
+        """Build a TQ paged cache (same as TestDequantPaged)."""
+        head_dim = codebook.head_dim
+        num_blocks_per_seq = (seq_len + block_size - 1) // block_size
+        total_blocks = num_seqs * num_blocks_per_seq + 4
+
+        data_dim = head_dim if codebook.byte_mode else head_dim // 2
+        scale_pad = 4
+        if codebook.qjl:
+            padded_dim = data_dim + scale_pad + sign_bytes_padded(
+                head_dim) + scale_pad
+        else:
+            padded_dim = data_dim + scale_pad
+
+        kv_cache = torch.zeros(
+            (total_blocks, 2, block_size, nkv, padded_dim),
+            dtype=torch.uint8, device="cuda")
+
+        block_table = torch.zeros(
+            (num_seqs, num_blocks_per_seq), dtype=torch.int32, device="cuda")
+        for s in range(num_seqs):
+            for p in range(num_blocks_per_seq):
+                block_table[s, p] = s * num_blocks_per_seq + p
+
+        seq_lens = torch.full(
+            (num_seqs,), seq_len, dtype=torch.int32, device="cuda")
+
+        from vllm.v1.attention.ops.turboquant import (
+            turboquant_reshape_and_cache,
+        )
+
+        total_tokens = num_seqs * seq_len
+        slot_mapping = torch.zeros(total_tokens, dtype=torch.long,
+                                    device="cuda")
+        for s in range(num_seqs):
+            for i in range(seq_len):
+                blk = block_table[s, i // block_size].item()
+                off = i % block_size
+                slot_mapping[s * seq_len + i] = blk * block_size + off
+
+        key = torch.randn(
+            total_tokens, nkv, head_dim, dtype=torch.bfloat16, device="cuda")
+        value = torch.randn(
+            total_tokens, nkv, head_dim, dtype=torch.bfloat16, device="cuda")
+
+        key_cache, value_cache = kv_cache.unbind(1)
+        dtype_sz = 1
+        kv_half_bytes = block_size * nkv * padded_dim * dtype_sz
+        idx_data_bytes = head_dim if codebook.byte_mode else head_dim // 2
+
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor(
+            [], dtype=torch.float32, device="cuda").set_(raw)
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_dim // 4
+        head_f32 = padded_dim // 4
+        norm_off_f32 = idx_data_bytes // 4
+
+        k_norms = torch.as_strided(
+            base_f32, size=(total_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=norm_off_f32)
+        v_base_f32 = kv_half_bytes // 4
+        v_norms = torch.as_strided(
+            base_f32, size=(total_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=v_base_f32 + norm_off_f32)
+        k_norms.fill_(0.0)
+        v_norms.fill_(0.0)
+
+        k_signs = v_signs = k_res_scales = v_res_scales = None
+        if codebook.qjl:
+            sbytes = sign_bytes_padded(head_dim)
+            sign_byte_off = idx_data_bytes + 4
+            base_u8 = torch.tensor(
+                [], dtype=torch.uint8, device="cuda").set_(raw)
+            full_block_u8 = 2 * kv_half_bytes
+            slot_u8 = nkv * padded_dim
+            head_u8 = padded_dim
+
+            k_signs = torch.as_strided(
+                base_u8, size=(total_blocks, block_size, nkv, sbytes),
+                stride=(full_block_u8, slot_u8, head_u8, 1),
+                storage_offset=sign_byte_off)
+            v_signs = torch.as_strided(
+                base_u8, size=(total_blocks, block_size, nkv, sbytes),
+                stride=(full_block_u8, slot_u8, head_u8, 1),
+                storage_offset=kv_half_bytes + sign_byte_off)
+            k_signs.fill_(0)
+            v_signs.fill_(0)
+
+            res_scale_off = (idx_data_bytes + 4 + sbytes) // 4
+            k_res_scales = torch.as_strided(
+                base_f32, size=(total_blocks, block_size, nkv),
+                stride=(full_block_f32, slot_f32, head_f32),
+                storage_offset=res_scale_off)
+            v_res_scales = torch.as_strided(
+                base_f32, size=(total_blocks, block_size, nkv),
+                stride=(full_block_f32, slot_f32, head_f32),
+                storage_offset=v_base_f32 + res_scale_off)
+            k_res_scales.fill_(0.0)
+            v_res_scales.fill_(0.0)
+
+        turboquant_reshape_and_cache(
+            key, value, key_cache, value_cache,
+            k_norms, v_norms, slot_mapping, codebook,
+            k_signs=k_signs, v_signs=v_signs,
+            k_res_scales=k_res_scales, v_res_scales=v_res_scales,
+        )
+
+        return dict(
+            kv_cache=kv_cache,
+            key_cache=key_cache, value_cache=value_cache,
+            k_norms=k_norms, v_norms=v_norms,
+            k_signs=k_signs, v_signs=v_signs,
+            k_res_scales=k_res_scales, v_res_scales=v_res_scales,
+            block_table=block_table, seq_lens=seq_lens,
+            codebook=codebook, key=key, value=value,
+            block_size=block_size, nkv=nkv,
+            total_blocks=total_blocks,
+            num_seqs=num_seqs, seq_len=seq_len,
+        )
+
+    def test_attention_with_tq_vs_bf16(self):
+        """Full pipeline: encode K/V with TQ, rotate Q, do attention with
+        staging, inverse rotate output. Compare with bf16 reference.
+        Cosine sim > 0.998."""
+        from vllm.v1.attention.ops.turboquant import (
+            inverse_rotate_output,
+            rotate_query,
+            turboquant_dequant_paged,
+        )
+
+        torch.manual_seed(42)
+
+        head_dim = 128
+        nkv = 4
+        num_seqs = 2
+        seq_len = 32
+        block_size = 16
+
+        codebook = TurboQuantCodebook(n_bits=6, head_dim=head_dim,
+                                       device="cuda", qjl=True)
+        cd = self._build_paged_cache(codebook, num_seqs=num_seqs,
+                                      seq_len=seq_len, block_size=block_size,
+                                      nkv=nkv)
+
+        # --- TQ path: dequant to staging, rotate Q, do attention ---
+        max_bps = cd['block_table'].shape[1]
+        staging_blocks = num_seqs * max_bps
+
+        staging_key = torch.zeros(
+            (staging_blocks, block_size, nkv, head_dim),
+            dtype=torch.bfloat16, device="cuda")
+        staging_val = torch.zeros(
+            (staging_blocks, block_size, nkv, head_dim),
+            dtype=torch.bfloat16, device="cuda")
+
+        turboquant_dequant_paged(
+            cd['key_cache'], cd['value_cache'],
+            cd['k_norms'], cd['v_norms'],
+            staging_key, staging_val,
+            codebook, cd['block_table'], cd['seq_lens'], max_bps,
+            k_signs=cd['k_signs'], v_signs=cd['v_signs'],
+            k_res_scales=cd['k_res_scales'],
+            v_res_scales=cd['v_res_scales'],
+        )
+
+        # Reassemble K/V per sequence from staging blocks
+        # staging layout: [staging_blk, block_size, nkv, head_dim]
+        # staging_blk = seq * max_bps + page
+        tq_outputs = []
+        for s in range(num_seqs):
+            k_parts = []
+            v_parts = []
+            for p in range(max_bps):
+                staging_blk = s * max_bps + p
+                k_parts.append(staging_key[staging_blk])  # [BS, nkv, HD]
+                v_parts.append(staging_val[staging_blk])
+            # [seq_len, nkv, head_dim] — staging K/V in rotated space
+            K_staged = torch.cat(k_parts, dim=0)[:seq_len]
+            V_staged = torch.cat(v_parts, dim=0)[:seq_len]
+
+            # Query: one query token per sequence for simplicity
+            q = torch.randn(1, nkv, head_dim, dtype=torch.bfloat16,
+                             device="cuda")
+            q_rot = rotate_query(q, codebook.rotation_matrix_T)
+
+            # Attention scores: q_rot @ K_staged^T (per head)
+            # q_rot: [1, nkv, HD], K_staged: [seq_len, nkv, HD]
+            scale = 1.0 / math.sqrt(head_dim)
+            # [nkv, 1, seq_len]
+            scores = torch.einsum('bnh,snh->nbs', q_rot.float(),
+                                   K_staged.float()) * scale
+            weights = torch.softmax(scores, dim=-1)  # [nkv, 1, seq_len]
+            # [nkv, 1, HD]
+            attn_out_rot = torch.einsum('nbs,snh->nbh', weights,
+                                         V_staged.float())
+            # [1, nkv, HD]
+            attn_out_rot = attn_out_rot.permute(1, 0, 2)
+            attn_out = inverse_rotate_output(
+                attn_out_rot.bfloat16(), codebook.rotation_matrix)
+
+            # --- BF16 reference path ---
+            key_orig = cd['key'][s * seq_len:(s + 1) * seq_len]
+            val_orig = cd['value'][s * seq_len:(s + 1) * seq_len]
+
+            scores_ref = torch.einsum(
+                'bnh,snh->nbs', q.float(),
+                key_orig.float()) * scale
+            weights_ref = torch.softmax(scores_ref, dim=-1)
+            attn_ref = torch.einsum('nbs,snh->nbh', weights_ref,
+                                     val_orig.float())
+            attn_ref = attn_ref.permute(1, 0, 2)  # [1, nkv, HD]
+
+            # Per-head cosine similarity
+            cos_sim = torch.nn.functional.cosine_similarity(
+                attn_out.float().reshape(-1, head_dim),
+                attn_ref.float().reshape(-1, head_dim), dim=-1)
+            tq_outputs.append(cos_sim)
+
+        all_sims = torch.cat(tq_outputs)
+        mean_sim = all_sims.mean().item()
+        assert mean_sim > 0.998, (
+            f"Mean cosine similarity {mean_sim:.6f} too low (threshold 0.998)")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

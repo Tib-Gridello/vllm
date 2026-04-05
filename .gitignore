@@ -239,5 +239,29 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
-# Ignore generated cpu headers 
+# Ignore generated cpu headers
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# TurboQuant dev/test scripts (not part of vLLM PR)
+/benchmark_turboquant.py
+/sweep_turboquant.py
+/test_paper_algo.py
+/apply_patches.py
+/bench_attn_e2e.py
+/bench_vllm_e2e.py
+/diag_encode_dequant.py
+/diag_logprobs.py
+/diag_quality.py
+/eval_perplexity.py
+/eval_robust.py
+/profile_tq.py
+/run_full_eval.py
+/run_mmlu_eval.py
+/test_dequant_gpu.py
+/test_mmlu_quality.py
+/test_outlier_gpu.py
+/TURBOQUANT_HANDOFF.md
+
+# TurboQuant untracked internal files (standalone utilities, not imported)
+vllm/compilation/passes/fusion/swiglu_mlp_fusion.py
+vllm/v1/attention/ops/turboquant_calibrate.py
