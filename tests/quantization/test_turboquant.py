@@ -628,10 +628,11 @@ class TestQJLEncodeDecode:
         assert (res_scales >= 0).all()
 
     def test_qjl_codebook_flag(self):
-        """QJL flag should only be True for byte mode."""
+        """QJL flag is respected for all bit widths."""
+        # QJL works in both nibble (4-bit) and byte (6-bit) modes
         cb4 = TurboQuantCodebook(n_bits=4, head_dim=128, device="cpu",
                                   qjl=True)
-        assert cb4.qjl is False  # nibble mode can't do QJL
+        assert cb4.qjl is True
         cb6 = TurboQuantCodebook(n_bits=6, head_dim=128, device="cpu",
                                   qjl=True)
         assert cb6.qjl is True
@@ -727,7 +728,6 @@ class TestDequantPaged:
 
     @pytest.fixture
     def codebook_4bit_qjl(self):
-        # nibble mode — qjl is forced off for nibble mode
         return TurboQuantCodebook(n_bits=4, head_dim=128, device="cuda",
                                    qjl=True)
 
@@ -990,7 +990,6 @@ class TestDequantPaged:
     def test_dequant_nibble(self, codebook_4bit_qjl):
         """Nibble mode: dequant kernel matches reference."""
         torch.manual_seed(42)
-        # QJL is forced off in nibble mode by TurboQuantCodebook
         cd = self._build_paged_cache(codebook_4bit_qjl, num_seqs=2,
                                       seq_len=32, block_size=16, nkv=2)
         staging_key, staging_val = self._run_dequant(cd)
