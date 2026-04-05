@@ -117,17 +117,35 @@ def compute_beta_centroids(
     return boundaries.float(), centroids.float()
 
 
+def _hadamard_matrix(d: int) -> torch.Tensor:
+    """Walsh-Hadamard matrix of size d (must be power of 2)."""
+    H = torch.tensor([[1.0]])
+    k = 1
+    while k < d:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1),
+        ], dim=0)
+        k *= 2
+    return H[:d, :d] / math.sqrt(d)
+
+
 def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
-    """Random orthogonal matrix via QR decomposition (paper's method).
+    """Randomized Hadamard rotation matrix.
+
+    Uses D @ H where D is a random diagonal ±1 matrix and H is the
+    Walsh-Hadamard matrix.  This spreads energy uniformly across
+    coordinates (no pathological data-rotation alignments), unlike
+    random QR which can create extreme coordinate values.
 
     Returns:
         R: (d, d) orthogonal matrix where R @ R^T = I
     """
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    M = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
-    Q, R_qr = torch.linalg.qr(M)
-    Q = Q * torch.diag(R_qr).sign().unsqueeze(0)
-    return Q
+    signs = (torch.randint(0, 2, (d,), generator=gen,
+                           dtype=torch.float32) * 2 - 1)
+    H = _hadamard_matrix(d)
+    return signs.unsqueeze(1) * H
 
 
 # ============================================================================
