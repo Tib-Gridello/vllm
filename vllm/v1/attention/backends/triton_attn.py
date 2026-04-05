@@ -915,7 +915,11 @@ class TritonAttentionImpl(AttentionImpl):
 
                 if use_dequant_first:
                     # Decompress TQ → bf16 staging, standard attention.
-                    # Incremental: only dirty blocks are decompressed.
+                    # TODO(turboquant): Incremental dequant is disabled
+                    # because per-physical-block dirty tracking is wrong
+                    # when batch composition changes (new sequences get
+                    # stale staging data for prefix-cached blocks).
+                    # Need per-staging-position tracking instead.
                     from vllm.v1.attention.ops.turboquant import (
                         turboquant_dequant_paged,
                     )
@@ -939,14 +943,11 @@ class TritonAttentionImpl(AttentionImpl):
                                       if cb.qjl else None),
                         v_res_scales=(self._tq_v_res_scales
                                       if cb.qjl else None),
-                        dirty_blocks=(self._tq_dirty_blocks
-                                      if self._tq_staging_valid
-                                      else None),
+                        # Always full dequant for correctness.
+                        # Incremental dequant needs per-staging-position
+                        # tracking, not per-physical-block.
+                        dirty_blocks=None,
                     )
-                    # Clear dirty flags after dequant
-                    if self._tq_dirty_blocks is not None:
-                        self._tq_dirty_blocks.fill_(False)
-                        self._tq_staging_valid = True
                     key_cache = self._tq_staging_key
                     value_cache = self._tq_staging_val
                     kv_quant_mode_for_attn = KVQuantMode.NONE
