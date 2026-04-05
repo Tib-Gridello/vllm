@@ -63,8 +63,8 @@ def qjl_padded_dim(head_dim: int) -> int:
 def compute_beta_centroids(
     d: int,
     n_bits: int,
-    n_iters: int = 200,
-    n_samples: int = 500000,
+    n_iters: int = 100,
+    n_samples: int = 200000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lloyd-Max centroids for Beta((d-1)/2) on [-1, 1].
 
@@ -72,6 +72,9 @@ def compute_beta_centroids(
     unit vector in R^d after orthogonal rotation.  For large d the
     distribution is tightly concentrated near zero (std ~ 1/sqrt(d)), so
     centroid initialization must place all levels inside the data range.
+
+    Uses vectorized assignment via searchsorted (O(n log k) per iteration)
+    and scatter_add for mean computation, instead of O(n*k) distance matrix.
 
     Returns:
         boundaries: (2^n_bits - 1,) decision boundaries
@@ -85,8 +88,7 @@ def compute_beta_centroids(
     samples = beta_dist.sample((n_samples,)).double() * 2 - 1
 
     # Initialize centroids at distribution quantiles so every level
-    # starts inside the data range.  linspace(-0.95, 0.95) wastes most
-    # levels for large d (e.g. d=128: only 9/16 centroids get samples).
+    # starts inside the data range.
     quantiles = torch.linspace(
         0.5 / n_levels, 1.0 - 0.5 / n_levels, n_levels, dtype=torch.float64
     )
@@ -95,16 +97,20 @@ def compute_beta_centroids(
     centroids = sorted_samples[q_idx]
 
     for _ in range(n_iters):
-        dists = (samples.unsqueeze(1) - centroids.unsqueeze(0)).abs()
-        assignments = dists.argmin(dim=1)
+        # Assign samples to nearest centroid via binary search on boundaries.
+        # boundaries[i] = midpoint between centroids[i] and centroids[i+1].
+        boundaries = (centroids[:-1] + centroids[1:]) / 2.0
+        assignments = torch.searchsorted(boundaries, samples)
 
-        new_centroids = torch.zeros_like(centroids)
-        for i in range(n_levels):
-            mask = assignments == i
-            if mask.sum() > 0:
-                new_centroids[i] = samples[mask].mean()
-            else:
-                new_centroids[i] = centroids[i]
+        # Compute new centroids as mean of assigned samples (vectorized).
+        sums = torch.zeros(n_levels, dtype=torch.float64)
+        counts = torch.zeros(n_levels, dtype=torch.float64)
+        sums.scatter_add_(0, assignments, samples)
+        counts.scatter_add_(0, assignments, torch.ones_like(samples))
+
+        nonempty = counts > 0
+        new_centroids = centroids.clone()
+        new_centroids[nonempty] = sums[nonempty] / counts[nonempty]
         centroids = new_centroids
 
     boundaries = (centroids[:-1] + centroids[1:]) / 2.0
