@@ -119,7 +119,7 @@ def compute_beta_centroids(
 
 def _hadamard_matrix(d: int) -> torch.Tensor:
     """Walsh-Hadamard matrix of size d (must be power of 2)."""
-    H = torch.tensor([[1.0]])
+    H = torch.tensor([[1.0]], device="cpu")
     k = 1
     while k < d:
         H = torch.cat([
@@ -143,6 +143,7 @@ def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
     """
     gen = torch.Generator(device="cpu").manual_seed(seed)
     signs = (torch.randint(0, 2, (d,), generator=gen,
+                           device="cpu",
                            dtype=torch.float32) * 2 - 1)
     H = _hadamard_matrix(d)
     return signs.unsqueeze(1) * H
