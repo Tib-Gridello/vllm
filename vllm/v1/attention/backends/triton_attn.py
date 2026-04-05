@@ -1165,11 +1165,19 @@ class TritonAttentionImpl(AttentionImpl):
             if self._tq_dequant_first:
                 num_blocks = kv_cache.shape[0]
                 block_size = kv_cache.shape[2]
-                if (self._tq_dirty_blocks is None
-                        or self._tq_dirty_blocks.shape[0] < num_blocks):
+                if self._tq_dirty_blocks is None:
                     self._tq_dirty_blocks = torch.ones(
                         num_blocks, dtype=torch.bool,
                         device=kv_cache.device)
+                    self._tq_staging_valid = False
+                elif self._tq_dirty_blocks.shape[0] < num_blocks:
+                    # Grow array preserving old state; only new blocks
+                    # are marked dirty (old blocks may already be staged).
+                    old = self._tq_dirty_blocks
+                    self._tq_dirty_blocks = torch.ones(
+                        num_blocks, dtype=torch.bool,
+                        device=kv_cache.device)
+                    self._tq_dirty_blocks[:old.shape[0]] = old
                     self._tq_staging_valid = False
                 valid = slot_mapping >= 0
                 if valid.any():

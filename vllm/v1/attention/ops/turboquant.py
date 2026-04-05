@@ -9,7 +9,7 @@ Near-optimal Distortion Rate" (Google Research, ICLR 2026, arXiv:2504.19874).
 Algorithm (matching the paper exactly):
   1. Random orthogonal rotation R via QR decomposition
   2. Normalize K/V to unit vectors, store L2 norm separately
-  3. Rotate: y = R @ x_hat (coordinates become ~independent Beta(d/2))
+  3. Rotate: y = R @ x_hat (coordinates become ~independent Beta((d-1)/2))
   4. Lloyd-Max scalar quantize each coordinate for Beta(d/2) on [-1,1]
   5. At attention time: rotate Q by R (Q_rot = Q @ R^T), no inverse
      rotation needed for K. Inverse-rotate output by R^T for V.
@@ -166,7 +166,7 @@ class TurboQuantCodebook:
         self.qjl = qjl
         self.sign_bytes = sign_bytes_padded(head_dim) if self.qjl else 0
 
-        # Beta(d/2) centroids on [-1, 1] (NOT N(0,1)!)
+        # Beta((d-1)/2) centroids on [-1, 1] (NOT N(0,1)!)
         boundaries, centroids = compute_beta_centroids(head_dim, n_bits)
         self.boundaries = boundaries.contiguous().to(device)
         self.centroids = centroids.contiguous().to(device)
@@ -1045,7 +1045,7 @@ def turboquant_reshape_and_cache(
                     HEAD_DIM=codebook.head_dim,
                     N_LEVELS=codebook.n_levels,
                     QJL_ENABLED=qjl,
-                    SIGN_BYTES=codebook.head_dim // 8 if qjl else 1,
+                    SIGN_BYTES=(codebook.head_dim + 7) // 8 if qjl else 1,
                     LOG2_LEVELS=log2_levels,
                 )
             else:
@@ -1073,7 +1073,7 @@ def turboquant_reshape_and_cache(
                     N_LEVELS=codebook.n_levels,
                     HALF_DIM=hd // 2,
                     QJL_ENABLED=qjl,
-                    SIGN_BYTES_HALF=hd // 16 if qjl else 1,
+                    SIGN_BYTES_HALF=(hd // 2 + 7) // 8 if qjl else 1,
                     LOG2_LEVELS=log2_levels,
                 )
 
@@ -1448,7 +1448,7 @@ def turboquant_dequant_paged(
                 BLOCK_SIZE=block_size,
                 HEAD_DIM=codebook.head_dim,
                 QJL_ENABLED=qjl,
-                SIGN_BYTES=codebook.head_dim // 8 if qjl else 1,
+                SIGN_BYTES=(codebook.head_dim + 7) // 8 if qjl else 1,
                 DIRTY_CHECK=dirty_check,
             )
         else:
@@ -1479,7 +1479,7 @@ def turboquant_dequant_paged(
                 HEAD_DIM=hd,
                 HALF_DIM=hd // 2,
                 QJL_ENABLED=qjl,
-                SIGN_BYTES_HALF=hd // 16 if qjl else 1,
+                SIGN_BYTES_HALF=(hd // 2 + 7) // 8 if qjl else 1,
                 DIRTY_CHECK=dirty_check,
             )
 
