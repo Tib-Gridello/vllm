@@ -82,7 +82,10 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "12.9"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
-    VLLM_TURBOQUANT_BITS: int = 4
+    VLLM_TURBOQUANT_BITS: int = 0
+    VLLM_TURBOQUANT_QJL: bool = True
+    VLLM_TURBOQUANT_DEQUANT_FIRST: bool = True
+    VLLM_TURBOQUANT_OUTLIER_BITS: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -509,8 +512,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
-    # Number of bits for TurboQuant KV cache compression (3 or 4).
-    "VLLM_TURBOQUANT_BITS": lambda: int(os.getenv("VLLM_TURBOQUANT_BITS", "4")),
+    # Number of bits for TurboQuant KV cache compression (3-8, 0=auto).
+    "VLLM_TURBOQUANT_BITS": lambda: int(os.getenv("VLLM_TURBOQUANT_BITS", "0")),
+    # Enable QJL sign-correction for TurboQuant byte mode (default: enabled).
+    "VLLM_TURBOQUANT_QJL": lambda: bool(int(os.getenv("VLLM_TURBOQUANT_QJL", "1"))),
+    # Dequant-first: decompress TQ blocks to bf16 before attention.
+    "VLLM_TURBOQUANT_DEQUANT_FIRST":
+        lambda: bool(int(os.getenv(
+            "VLLM_TURBOQUANT_DEQUANT_FIRST", "1"))),
+    # Outlier channel bits: "outlier_bits,regular_bits" e.g. "4,2"
+    # for 2.5-bit avg. Empty string = disabled (uniform bits).
+    "VLLM_TURBOQUANT_OUTLIER_BITS":
+        lambda: os.getenv("VLLM_TURBOQUANT_OUTLIER_BITS", ""),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
