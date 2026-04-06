@@ -42,6 +42,14 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
     "turboquant": torch.uint8,
+    # TurboQuant named presets (all stored as uint8)
+    "tq-k8v8": torch.uint8,
+    "tq-k8v8-qjl": torch.uint8,
+    "tq-k4v4": torch.uint8,
+    "tq-k4v4-qjl": torch.uint8,
+    "tq-k4v8": torch.uint8,
+    "tq-k4v2o": torch.uint8,
+    "tq-k2v2": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -69,7 +77,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 
 
 def is_turboquant_kv_cache(kv_cache_dtype: str) -> bool:
-    return kv_cache_dtype == "turboquant"
+    return kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq-")
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:

@@ -24,12 +24,10 @@ time the correction is:
 """
 
 import math
-from typing import Optional
 
 import torch
 
 from vllm.triton_utils import tl, triton
-
 
 # ============================================================================
 # QJL Utilities
@@ -122,10 +120,13 @@ def _hadamard_matrix(d: int) -> torch.Tensor:
     H = torch.tensor([[1.0]], device="cpu")
     k = 1
     while k < d:
-        H = torch.cat([
-            torch.cat([H, H], dim=1),
-            torch.cat([H, -H], dim=1),
-        ], dim=0)
+        H = torch.cat(
+            [
+                torch.cat([H, H], dim=1),
+                torch.cat([H, -H], dim=1),
+            ],
+            dim=0,
+        )
         k *= 2
     return H[:d, :d] / math.sqrt(d)
 
@@ -142,9 +143,10 @@ def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
         R: (d, d) orthogonal matrix where R @ R^T = I
     """
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    signs = (torch.randint(0, 2, (d,), generator=gen,
-                           device="cpu",
-                           dtype=torch.float32) * 2 - 1)
+    signs = (
+        torch.randint(0, 2, (d,), generator=gen, device="cpu", dtype=torch.float32) * 2
+        - 1
+    )
     H = _hadamard_matrix(d)
     return signs.unsqueeze(1) * H
 
@@ -174,9 +176,7 @@ class TurboQuantCodebook:
         qjl: bool = True,
     ):
         if n_bits > 8:
-            raise ValueError(
-                f"TurboQuant supports n_bits <= 8, got {n_bits}."
-            )
+            raise ValueError(f"TurboQuant supports n_bits <= 8, got {n_bits}.")
         self.n_bits = n_bits
         self.n_levels = 2**n_bits
         self.head_dim = head_dim
@@ -221,8 +221,8 @@ def pack_nibbles(indices: torch.Tensor) -> torch.Tensor:
         (..., head_dim // 2) uint8
     """
     d = indices.shape[-1]
-    lo = indices[..., :d // 2]
-    hi = indices[..., d // 2:]
+    lo = indices[..., : d // 2]
+    hi = indices[..., d // 2 :]
     return (lo | (hi << 4)).to(torch.uint8)
 
 
@@ -259,8 +259,7 @@ def pack_2bit(indices: torch.Tensor) -> torch.Tensor:
     d = indices.shape[-1]
     assert d % 4 == 0
     reshaped = indices.reshape(*indices.shape[:-1], d // 4, 4)
-    shifts = torch.tensor([0, 2, 4, 6], dtype=torch.uint8,
-                           device=indices.device)
+    shifts = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=indices.device)
     packed = (reshaped << shifts).sum(dim=-1).to(torch.uint8)
     return packed
 
@@ -275,10 +274,10 @@ def unpack_2bit(packed: torch.Tensor, dim: int) -> torch.Tensor:
         (..., dim) uint8 with values in [0, 3]
     """
     n_bytes = packed.shape[-1]
-    shifts = torch.tensor([0, 2, 4, 6], dtype=torch.uint8,
-                           device=packed.device)
+    shifts = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=packed.device)
     unpacked = ((packed.unsqueeze(-1) >> shifts) & 0x03).reshape(
-        *packed.shape[:-1], n_bytes * 4)
+        *packed.shape[:-1], n_bytes * 4
+    )
     return unpacked[..., :dim]
 
 
@@ -324,8 +323,7 @@ class OutlierChannelConfig:
             # Default: first outlier_dim channels are outlier
             # (overridden by calibration)
             outlier_dim = int(head_dim * outlier_ratio)
-            self.outlier_mask = torch.zeros(head_dim, dtype=torch.bool,
-                                             device=device)
+            self.outlier_mask = torch.zeros(head_dim, dtype=torch.bool, device=device)
             self.outlier_mask[:outlier_dim] = True
 
         self.outlier_idx = self.outlier_mask.nonzero(as_tuple=True)[0]
@@ -333,8 +331,9 @@ class OutlierChannelConfig:
         self.outlier_dim = self.outlier_idx.shape[0]
         self.regular_dim = self.regular_idx.shape[0]
 
-        avg_bits = (self.outlier_dim * outlier_bits
-                    + self.regular_dim * regular_bits) / head_dim
+        avg_bits = (
+            self.outlier_dim * outlier_bits + self.regular_dim * regular_bits
+        ) / head_dim
         self.avg_bits = avg_bits
 
         # Separate codebooks for each group
@@ -376,8 +375,7 @@ class OutlierChannelConfig:
             calibration_path: Path to .pt file from turboquant_calibrate.
             layer_idx: Which attention layer.
         """
-        cal = torch.load(calibration_path, map_location="cpu",
-                          weights_only=True)
+        cal = torch.load(calibration_path, map_location="cpu", weights_only=True)
         mask = cal["masks"][layer_idx]
         head_dim = cal["head_dim"]
         outlier_ratio = cal["outlier_ratio"]
@@ -457,10 +455,6 @@ def outlier_encode_ref(
     device = tensor.device
     config_dev = config.to(device)
 
-    # Split channels
-    t_out = tensor[..., config_dev.outlier_idx]  # (..., outlier_dim)
-    t_reg = tensor[..., config_dev.regular_idx]  # (..., regular_dim)
-
     # Compute shared L2 norm (from full vector)
     norms = tensor.float().norm(dim=-1)
 
@@ -474,10 +468,8 @@ def outlier_encode_ref(
     R_reg_T = config_dev.regular_cb.rotation_matrix_T
     shape_out = t_out_hat.shape
     shape_reg = t_reg_hat.shape
-    y_out = (t_out_hat.reshape(-1, shape_out[-1]) @ R_out_T).reshape(
-        shape_out)
-    y_reg = (t_reg_hat.reshape(-1, shape_reg[-1]) @ R_reg_T).reshape(
-        shape_reg)
+    y_out = (t_out_hat.reshape(-1, shape_out[-1]) @ R_out_T).reshape(shape_out)
+    y_reg = (t_reg_hat.reshape(-1, shape_reg[-1]) @ R_reg_T).reshape(shape_reg)
 
     # Quantize each group
     out_cb = config_dev.outlier_cb
@@ -517,10 +509,8 @@ def outlier_decode_ref(
     R_reg = config_dev.regular_cb.rotation_matrix
     shape_out = out_vals.shape
     shape_reg = reg_vals.shape
-    x_out = (out_vals.float().reshape(-1, shape_out[-1]) @ R_out).reshape(
-        shape_out)
-    x_reg = (reg_vals.float().reshape(-1, shape_reg[-1]) @ R_reg).reshape(
-        shape_reg)
+    x_out = (out_vals.float().reshape(-1, shape_out[-1]) @ R_out).reshape(shape_out)
+    x_reg = (reg_vals.float().reshape(-1, shape_reg[-1]) @ R_reg).reshape(shape_reg)
 
     # Scale by norm
     x_out = norms.unsqueeze(-1) * x_out
@@ -615,8 +605,9 @@ def outlier_reshape_and_cache(
                 # Write outlier packed indices
                 cache[blk, off, h, :out_bytes] = out_packed[tok_i, h]
                 # Write regular packed indices after outlier
-                cache[blk, off, h,
-                      out_bytes:out_bytes + reg_bytes] = reg_packed[tok_i, h]
+                cache[blk, off, h, out_bytes : out_bytes + reg_bytes] = reg_packed[
+                    tok_i, h
+                ]
                 # Write norm
                 norms_out[blk, off, h] = nrm[tok_i, h]
 
@@ -675,32 +666,28 @@ def outlier_dequant_paged(
                             continue
 
                         # Read outlier packed nibbles
-                        out_raw = src_cache[
-                            phys_blk, slot, h, :out_bytes]
-                        out_idx = unpack_nibbles(
-                            out_raw.unsqueeze(0), out_dim).squeeze(0)
+                        out_raw = src_cache[phys_blk, slot, h, :out_bytes]
+                        out_idx = unpack_nibbles(out_raw.unsqueeze(0), out_dim).squeeze(
+                            0
+                        )
                         out_vals = out_centroids[out_idx.long()]
 
                         # Read regular 2-bit packed
                         reg_raw = src_cache[
-                            phys_blk, slot, h,
-                            out_bytes:out_bytes + reg_bytes]
-                        reg_idx = unpack_2bit(
-                            reg_raw.unsqueeze(0), reg_dim).squeeze(0)
+                            phys_blk, slot, h, out_bytes : out_bytes + reg_bytes
+                        ]
+                        reg_idx = unpack_2bit(reg_raw.unsqueeze(0), reg_dim).squeeze(0)
                         reg_vals = reg_centroids[reg_idx.long()]
 
                         # Inverse-rotate to original space
-                        x_out = (out_vals.float() @ R_out).to(
-                            torch.float32)
-                        x_reg = (reg_vals.float() @ R_reg).to(
-                            torch.float32)
+                        x_out = (out_vals.float() @ R_out).to(torch.float32)
+                        x_reg = (reg_vals.float() @ R_reg).to(torch.float32)
 
                         # Scale by norm and scatter
                         full = torch.zeros(head_dim, device=dev)
                         full[config_dev.outlier_idx] = norm * x_out
                         full[config_dev.regular_idx] = norm * x_reg
-                        staging[staging_blk, slot, h] = full.to(
-                            torch.bfloat16)
+                        staging[staging_blk, slot, h] = full.to(torch.bfloat16)
 
 
 # ============================================================================
@@ -767,18 +754,15 @@ def _turboquant_encode_packed_kernel(
     off = slot % BLOCK_SIZE
 
     # Load pre-computed L2 norm
-    norm = tl.load(orig_norms_ptr + tok * stride_on_tok
-                   + head * stride_on_head)
+    norm = tl.load(orig_norms_ptr + tok * stride_on_tok + head * stride_on_head)
 
     # Load both halves of rotated normalized vector
     base = tok * stride_r_tok + head * stride_r_head
     offs_lo = tl.arange(0, HALF_DIM)
     offs_hi = HALF_DIM + tl.arange(0, HALF_DIM)
 
-    y_lo = tl.load(rotated_ptr + base + offs_lo * stride_r_dim).to(
-        tl.float32)
-    y_hi = tl.load(rotated_ptr + base + offs_hi * stride_r_dim).to(
-        tl.float32)
+    y_lo = tl.load(rotated_ptr + base + offs_lo * stride_r_dim).to(tl.float32)
+    y_hi = tl.load(rotated_ptr + base + offs_hi * stride_r_dim).to(tl.float32)
 
     # Vectorized binary search: find quantization level for each coordinate.
     # idx = number of boundaries where y > boundary (= bisect_left position).
@@ -806,8 +790,7 @@ def _turboquant_encode_packed_kernel(
     packed = idx_lo | (idx_hi << 4)
 
     # Scatter packed indices to cache
-    c_base = (blk * stride_c_blk + off * stride_c_slot
-              + head * stride_c_head)
+    c_base = blk * stride_c_blk + off * stride_c_slot + head * stride_c_head
     tl.store(cache_ptr + c_base + offs_lo * stride_c_dim, packed)
 
     # Scatter norm (float32 via strided view)
@@ -823,10 +806,10 @@ def _turboquant_encode_packed_kernel(
         r_hi = y_hi - c_hi
 
         # res_scale = mean(|residual|) over full HEAD_DIM
-        res_scale = (tl.sum(tl.abs(r_lo), axis=0)
-                     + tl.sum(tl.abs(r_hi), axis=0)) / HEAD_DIM
-        rs_off = (blk * stride_rs_blk + off * stride_rs_slot
-                  + head * stride_rs_head)
+        res_scale = (
+            tl.sum(tl.abs(r_lo), axis=0) + tl.sum(tl.abs(r_hi), axis=0)
+        ) / HEAD_DIM
+        rs_off = blk * stride_rs_blk + off * stride_rs_slot + head * stride_rs_head
         tl.store(res_scale_ptr + rs_off, res_scale)
 
         # Pack lo-half sign bits (coords 0..HALF_DIM-1 → bytes 0..SIGN_BYTES_HALF-1)
@@ -836,21 +819,21 @@ def _turboquant_encode_packed_kernel(
         packed_lo_2d = tl.reshape(shifted_lo, [SIGN_BYTES_HALF, 8])
         packed_lo_bytes = tl.sum(packed_lo_2d, axis=1).to(tl.uint8)
 
-        # Pack hi-half sign bits (coords HALF_DIM..HEAD_DIM-1 → bytes SIGN_BYTES_HALF..2*SIGN_BYTES_HALF-1)
+        # Pack hi-half sign bits
+        # coords HALF_DIM..HEAD_DIM-1 → bytes SIGN_BYTES_HALF..2*SBH-1
         sign_hi = (r_hi >= 0).to(tl.int32)
         shifted_hi = sign_hi << bit_lo  # same bit positions
         packed_hi_2d = tl.reshape(shifted_hi, [SIGN_BYTES_HALF, 8])
         packed_hi_bytes = tl.sum(packed_hi_2d, axis=1).to(tl.uint8)
 
         # Store sign bytes
-        sg_base = (blk * stride_sg_blk + off * stride_sg_slot
-                   + head * stride_sg_head)
+        sg_base = blk * stride_sg_blk + off * stride_sg_slot + head * stride_sg_head
         offs_sb = tl.arange(0, SIGN_BYTES_HALF)
-        tl.store(signs_ptr + sg_base + offs_sb * stride_sg_byte,
-                 packed_lo_bytes)
-        tl.store(signs_ptr + sg_base
-                 + (SIGN_BYTES_HALF + offs_sb) * stride_sg_byte,
-                 packed_hi_bytes)
+        tl.store(signs_ptr + sg_base + offs_sb * stride_sg_byte, packed_lo_bytes)
+        tl.store(
+            signs_ptr + sg_base + (SIGN_BYTES_HALF + offs_sb) * stride_sg_byte,
+            packed_hi_bytes,
+        )
 
 
 @triton.jit
@@ -881,7 +864,7 @@ def _turboquant_encode_byte_kernel(
     boundaries_ptr,
     centroids_ptr,
     # QJL sign output (uint8 packed bits in cache)
-    signs_ptr,         # cache ptr offset to sign region
+    signs_ptr,  # cache ptr offset to sign region
     stride_sg_blk: tl.int64,
     stride_sg_slot: tl.int64,
     stride_sg_head: tl.int64,
@@ -915,8 +898,7 @@ def _turboquant_encode_byte_kernel(
     off = slot % BLOCK_SIZE
 
     # Load pre-computed L2 norm
-    norm = tl.load(orig_norms_ptr + tok * stride_on_tok
-                   + head * stride_on_head)
+    norm = tl.load(orig_norms_ptr + tok * stride_on_tok + head * stride_on_head)
 
     # Load full rotated normalized vector
     base = tok * stride_r_tok + head * stride_r_head
@@ -936,8 +918,7 @@ def _turboquant_encode_byte_kernel(
     idx = lo.to(tl.uint8)
 
     # Scatter raw uint8 indices to cache (no packing)
-    c_base = (blk * stride_c_blk + off * stride_c_slot
-              + head * stride_c_head)
+    c_base = blk * stride_c_blk + off * stride_c_slot + head * stride_c_head
     tl.store(cache_ptr + c_base + offs_d * stride_c_dim, idx)
 
     # Scatter norm (float32 via strided view)
@@ -955,17 +936,16 @@ def _turboquant_encode_byte_kernel(
         res_scale = tl.sum(tl.abs(residual), axis=0) / HEAD_DIM
 
         # Store res_scale (float32 via strided view)
-        rs_off = (blk * stride_rs_blk + off * stride_rs_slot
-                  + head * stride_rs_head)
+        rs_off = blk * stride_rs_blk + off * stride_rs_slot + head * stride_rs_head
         tl.store(res_scale_ptr + rs_off, res_scale)
 
         # Pack sign bits: sign_byte[j] = OR over bits 0..7 of
         #   ((residual[j*8+bit] >= 0) << bit)
         # Using reshape + sum trick: since bits are non-overlapping,
         # sum == OR for these shifted single-bit values.
-        sign_raw = (residual >= 0).to(tl.int32)      # (HEAD_DIM,) 0/1
-        bit_pos = (offs_d % 8).to(tl.int32)           # (HEAD_DIM,) 0-7
-        shifted = sign_raw << bit_pos                  # (HEAD_DIM,)
+        sign_raw = (residual >= 0).to(tl.int32)  # (HEAD_DIM,) 0/1
+        bit_pos = (offs_d % 8).to(tl.int32)  # (HEAD_DIM,) 0-7
+        shifted = sign_raw << bit_pos  # (HEAD_DIM,)
         # Reshape to (SIGN_BYTES, 8) — works because HEAD_DIM may have
         # padding but SIGN_BYTES * 8 >= HEAD_DIM.  We zero-pad to
         # SIGN_BYTES * 8 via the initial zeros above.
@@ -973,8 +953,7 @@ def _turboquant_encode_byte_kernel(
         packed = tl.sum(packed_2d, axis=1).to(tl.uint8)  # (SIGN_BYTES,)
 
         # Scatter packed sign bytes
-        sg_base = (blk * stride_sg_blk + off * stride_sg_slot
-                   + head * stride_sg_head)
+        sg_base = blk * stride_sg_blk + off * stride_sg_slot + head * stride_sg_head
         offs_sb = tl.arange(0, SIGN_BYTES)
         tl.store(signs_ptr + sg_base + offs_sb * stride_sg_byte, packed)
 
@@ -993,10 +972,10 @@ def turboquant_reshape_and_cache(
     v_norms: torch.Tensor,
     slot_mapping: torch.Tensor,
     codebook: TurboQuantCodebook,
-    k_signs: Optional[torch.Tensor] = None,
-    v_signs: Optional[torch.Tensor] = None,
-    k_res_scales: Optional[torch.Tensor] = None,
-    v_res_scales: Optional[torch.Tensor] = None,
+    k_signs: torch.Tensor | None = None,
+    v_signs: torch.Tensor | None = None,
+    k_res_scales: torch.Tensor | None = None,
+    v_res_scales: torch.Tensor | None = None,
 ) -> None:
     """Encode K/V with TurboQuant and scatter into paged cache.
 
@@ -1043,13 +1022,24 @@ def turboquant_reshape_and_cache(
             grid = (n_valid, n_heads)
             if codebook.byte_mode:
                 _turboquant_encode_byte_kernel[grid](
-                    y, y.stride(0), y.stride(1), y.stride(2),
-                    cache, cache.stride(0), cache.stride(1),
-                    cache.stride(2), cache.stride(3),
-                    norms_cache, norms_cache.stride(0),
-                    norms_cache.stride(1), norms_cache.stride(2),
-                    nrm, nrm.stride(0), nrm.stride(1),
-                    valid_slots, codebook.boundaries,
+                    y,
+                    y.stride(0),
+                    y.stride(1),
+                    y.stride(2),
+                    cache,
+                    cache.stride(0),
+                    cache.stride(1),
+                    cache.stride(2),
+                    cache.stride(3),
+                    norms_cache,
+                    norms_cache.stride(0),
+                    norms_cache.stride(1),
+                    norms_cache.stride(2),
+                    nrm,
+                    nrm.stride(0),
+                    nrm.stride(1),
+                    valid_slots,
+                    codebook.boundaries,
                     codebook.centroids,
                     signs_cache if qjl else cache,
                     signs_cache.stride(0) if qjl else 0,
@@ -1070,13 +1060,24 @@ def turboquant_reshape_and_cache(
             else:
                 hd = codebook.head_dim
                 _turboquant_encode_packed_kernel[grid](
-                    y, y.stride(0), y.stride(1), y.stride(2),
-                    cache, cache.stride(0), cache.stride(1),
-                    cache.stride(2), cache.stride(3),
-                    norms_cache, norms_cache.stride(0),
-                    norms_cache.stride(1), norms_cache.stride(2),
-                    nrm, nrm.stride(0), nrm.stride(1),
-                    valid_slots, codebook.boundaries,
+                    y,
+                    y.stride(0),
+                    y.stride(1),
+                    y.stride(2),
+                    cache,
+                    cache.stride(0),
+                    cache.stride(1),
+                    cache.stride(2),
+                    cache.stride(3),
+                    norms_cache,
+                    norms_cache.stride(0),
+                    norms_cache.stride(1),
+                    norms_cache.stride(2),
+                    nrm,
+                    nrm.stride(0),
+                    nrm.stride(1),
+                    valid_slots,
+                    codebook.boundaries,
                     codebook.centroids,
                     signs_cache if qjl else cache,
                     signs_cache.stride(0) if qjl else 0,
@@ -1105,12 +1106,12 @@ def rotate_query(query: torch.Tensor, R_T: torch.Tensor) -> torch.Tensor:
     """
     shape = query.shape
     d = shape[-1]
-    return (query.float().reshape(-1, d) @ R_T).reshape(shape).to(
-        query.dtype)
+    return (query.float().reshape(-1, d) @ R_T).reshape(shape).to(query.dtype)
 
 
 def inverse_rotate_output(
-    output: torch.Tensor, R: torch.Tensor,
+    output: torch.Tensor,
+    R: torch.Tensor,
 ) -> torch.Tensor:
     """Inverse-rotate attention output: out @ R (batch matmul).
 
@@ -1118,8 +1119,7 @@ def inverse_rotate_output(
     """
     shape = output.shape
     d = shape[-1]
-    return (output.float().reshape(-1, d) @ R).reshape(shape).to(
-        output.dtype)
+    return (output.float().reshape(-1, d) @ R).reshape(shape).to(output.dtype)
 
 
 # ============================================================================
@@ -1213,39 +1213,48 @@ def _turboquant_dequant_byte_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
 
     for slot in range(BLOCK_SIZE):
-        n_off = (phys_blk * stride_n_blk + slot * stride_n_slot
-                 + head * stride_n_head)
+        n_off = phys_blk * stride_n_blk + slot * stride_n_slot + head * stride_n_head
         norm = tl.load(norms_ptr + n_off)
 
-        o_base = (staging_blk * stride_o_blk + slot * stride_o_slot
-                  + head * stride_o_head)
+        o_base = (
+            staging_blk * stride_o_blk + slot * stride_o_slot + head * stride_o_head
+        )
 
         if norm == 0.0:
-            tl.store(out_ptr + o_base + offs_d * stride_o_dim,
-                     tl.zeros([HEAD_DIM], dtype=tl.bfloat16))
+            tl.store(
+                out_ptr + o_base + offs_d * stride_o_dim,
+                tl.zeros([HEAD_DIM], dtype=tl.bfloat16),
+            )
         else:
-            c_base = (phys_blk * stride_c_blk + slot * stride_c_slot
-                      + head * stride_c_head)
+            c_base = (
+                phys_blk * stride_c_blk + slot * stride_c_slot + head * stride_c_head
+            )
             indices = tl.load(cache_ptr + c_base + offs_d * stride_c_dim)
             vals = tl.load(centroids_ptr + indices.to(tl.int32))
 
             if QJL_ENABLED:
-                rs_off = (phys_blk * stride_rs_blk + slot * stride_rs_slot
-                          + head * stride_rs_head)
+                rs_off = (
+                    phys_blk * stride_rs_blk
+                    + slot * stride_rs_slot
+                    + head * stride_rs_head
+                )
                 res_scale = tl.load(res_scales_ptr + rs_off)
-                sg_base = (phys_blk * stride_sg_blk + slot * stride_sg_slot
-                           + head * stride_sg_head)
+                sg_base = (
+                    phys_blk * stride_sg_blk
+                    + slot * stride_sg_slot
+                    + head * stride_sg_head
+                )
                 byte_idx = offs_d // 8
                 bit_idx = (offs_d % 8).to(tl.int32)
                 sign_byte_vals = tl.load(
-                    signs_ptr + sg_base + byte_idx * stride_sg_byte)
+                    signs_ptr + sg_base + byte_idx * stride_sg_byte
+                )
                 sign_bits = (sign_byte_vals.to(tl.int32) >> bit_idx) & 1
                 sign_vec = 2.0 * sign_bits.to(tl.float32) - 1.0
                 vals = vals + res_scale * sign_vec
 
             result = norm * vals
-            tl.store(out_ptr + o_base + offs_d * stride_o_dim,
-                     result.to(tl.bfloat16))
+            tl.store(out_ptr + o_base + offs_d * stride_o_dim, result.to(tl.bfloat16))
 
 
 @triton.jit
@@ -1333,21 +1342,26 @@ def _turboquant_dequant_nibble_kernel(
     offs_full_hi = HALF_DIM + tl.arange(0, HALF_DIM)
 
     for slot in range(BLOCK_SIZE):
-        n_off = (phys_blk * stride_n_blk + slot * stride_n_slot
-                 + head * stride_n_head)
+        n_off = phys_blk * stride_n_blk + slot * stride_n_slot + head * stride_n_head
         norm = tl.load(norms_ptr + n_off)
 
-        o_base = (staging_blk * stride_o_blk + slot * stride_o_slot
-                  + head * stride_o_head)
+        o_base = (
+            staging_blk * stride_o_blk + slot * stride_o_slot + head * stride_o_head
+        )
 
         if norm == 0.0:
-            tl.store(out_ptr + o_base + offs_full_lo * stride_o_dim,
-                     tl.zeros([HALF_DIM], dtype=tl.bfloat16))
-            tl.store(out_ptr + o_base + offs_full_hi * stride_o_dim,
-                     tl.zeros([HALF_DIM], dtype=tl.bfloat16))
+            tl.store(
+                out_ptr + o_base + offs_full_lo * stride_o_dim,
+                tl.zeros([HALF_DIM], dtype=tl.bfloat16),
+            )
+            tl.store(
+                out_ptr + o_base + offs_full_hi * stride_o_dim,
+                tl.zeros([HALF_DIM], dtype=tl.bfloat16),
+            )
         else:
-            c_base = (phys_blk * stride_c_blk + slot * stride_c_slot
-                      + head * stride_c_head)
+            c_base = (
+                phys_blk * stride_c_blk + slot * stride_c_slot + head * stride_c_head
+            )
             packed = tl.load(cache_ptr + c_base + offs_lo * stride_c_dim)
             idx_lo = packed & 0x0F
             idx_hi = (packed >> 4) & 0x0F
@@ -1355,33 +1369,42 @@ def _turboquant_dequant_nibble_kernel(
             vals_hi = tl.load(centroids_ptr + idx_hi.to(tl.int32))
 
             if QJL_ENABLED:
-                rs_off = (phys_blk * stride_rs_blk + slot * stride_rs_slot
-                          + head * stride_rs_head)
+                rs_off = (
+                    phys_blk * stride_rs_blk
+                    + slot * stride_rs_slot
+                    + head * stride_rs_head
+                )
                 res_scale = tl.load(res_scales_ptr + rs_off)
-                sg_base = (phys_blk * stride_sg_blk + slot * stride_sg_slot
-                           + head * stride_sg_head)
+                sg_base = (
+                    phys_blk * stride_sg_blk
+                    + slot * stride_sg_slot
+                    + head * stride_sg_head
+                )
                 byte_idx_lo = offs_lo // 8
                 bit_idx_lo = (offs_lo % 8).to(tl.int32)
-                sg_lo = tl.load(
-                    signs_ptr + sg_base + byte_idx_lo * stride_sg_byte)
+                sg_lo = tl.load(signs_ptr + sg_base + byte_idx_lo * stride_sg_byte)
                 bits_lo = (sg_lo.to(tl.int32) >> bit_idx_lo) & 1
                 sign_lo = 2.0 * bits_lo.to(tl.float32) - 1.0
                 vals_lo = vals_lo + res_scale * sign_lo
                 byte_idx_hi = offs_lo // 8
                 bit_idx_hi = (offs_lo % 8).to(tl.int32)
                 sg_hi = tl.load(
-                    signs_ptr + sg_base
-                    + (SIGN_BYTES_HALF + byte_idx_hi) * stride_sg_byte)
+                    signs_ptr
+                    + sg_base
+                    + (SIGN_BYTES_HALF + byte_idx_hi) * stride_sg_byte
+                )
                 bits_hi = (sg_hi.to(tl.int32) >> bit_idx_hi) & 1
                 sign_hi = 2.0 * bits_hi.to(tl.float32) - 1.0
                 vals_hi = vals_hi + res_scale * sign_hi
 
             out_lo = norm * vals_lo
             out_hi = norm * vals_hi
-            tl.store(out_ptr + o_base + offs_full_lo * stride_o_dim,
-                     out_lo.to(tl.bfloat16))
-            tl.store(out_ptr + o_base + offs_full_hi * stride_o_dim,
-                     out_hi.to(tl.bfloat16))
+            tl.store(
+                out_ptr + o_base + offs_full_lo * stride_o_dim, out_lo.to(tl.bfloat16)
+            )
+            tl.store(
+                out_ptr + o_base + offs_full_hi * stride_o_dim, out_hi.to(tl.bfloat16)
+            )
 
 
 def turboquant_dequant_paged(
@@ -1395,11 +1418,11 @@ def turboquant_dequant_paged(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     max_blocks_per_seq: int,
-    k_signs: Optional[torch.Tensor] = None,
-    v_signs: Optional[torch.Tensor] = None,
-    k_res_scales: Optional[torch.Tensor] = None,
-    v_res_scales: Optional[torch.Tensor] = None,
-    dirty_blocks: Optional[torch.Tensor] = None,
+    k_signs: torch.Tensor | None = None,
+    v_signs: torch.Tensor | None = None,
+    k_res_scales: torch.Tensor | None = None,
+    v_res_scales: torch.Tensor | None = None,
+    dirty_blocks: torch.Tensor | None = None,
 ) -> None:
     """Decompress TQ paged cache blocks to bf16 staging buffers.
 
@@ -1443,9 +1466,14 @@ def turboquant_dequant_paged(
     for cache, norms, staging, signs, res_scales in items:
         if codebook.byte_mode:
             _turboquant_dequant_byte_kernel[grid](
-                cache, cache.stride(0), cache.stride(1),
-                cache.stride(2), cache.stride(3),
-                norms, norms.stride(0), norms.stride(1),
+                cache,
+                cache.stride(0),
+                cache.stride(1),
+                cache.stride(2),
+                cache.stride(3),
+                norms,
+                norms.stride(0),
+                norms.stride(1),
                 norms.stride(2),
                 signs if qjl else cache,
                 signs.stride(0) if qjl else 0,
@@ -1457,12 +1485,17 @@ def turboquant_dequant_paged(
                 res_scales.stride(1) if qjl else 0,
                 res_scales.stride(2) if qjl else 0,
                 centroids,
-                block_table, block_table.stride(0),
+                block_table,
+                block_table.stride(0),
                 block_table.stride(1),
                 seq_lens,
-                staging, staging.stride(0), staging.stride(1),
-                staging.stride(2), staging.stride(3),
-                max_blocks_per_seq, num_seqs,
+                staging,
+                staging.stride(0),
+                staging.stride(1),
+                staging.stride(2),
+                staging.stride(3),
+                max_blocks_per_seq,
+                num_seqs,
                 dirty_blocks if dirty_check else seq_lens,
                 BLOCK_SIZE=block_size,
                 HEAD_DIM=codebook.head_dim,
@@ -1473,9 +1506,14 @@ def turboquant_dequant_paged(
         else:
             hd = codebook.head_dim
             _turboquant_dequant_nibble_kernel[grid](
-                cache, cache.stride(0), cache.stride(1),
-                cache.stride(2), cache.stride(3),
-                norms, norms.stride(0), norms.stride(1),
+                cache,
+                cache.stride(0),
+                cache.stride(1),
+                cache.stride(2),
+                cache.stride(3),
+                norms,
+                norms.stride(0),
+                norms.stride(1),
                 norms.stride(2),
                 signs if qjl else cache,
                 signs.stride(0) if qjl else 0,
@@ -1487,12 +1525,17 @@ def turboquant_dequant_paged(
                 res_scales.stride(1) if qjl else 0,
                 res_scales.stride(2) if qjl else 0,
                 centroids,
-                block_table, block_table.stride(0),
+                block_table,
+                block_table.stride(0),
                 block_table.stride(1),
                 seq_lens,
-                staging, staging.stride(0), staging.stride(1),
-                staging.stride(2), staging.stride(3),
-                max_blocks_per_seq, num_seqs,
+                staging,
+                staging.stride(0),
+                staging.stride(1),
+                staging.stride(2),
+                staging.stride(3),
+                max_blocks_per_seq,
+                num_seqs,
                 dirty_blocks if dirty_check else seq_lens,
                 BLOCK_SIZE=block_size,
                 HEAD_DIM=hd,
@@ -1510,17 +1553,25 @@ def turboquant_dequant_paged(
 
 @triton.jit
 def _turboquant_encode_signflip_kernel(
-    key_ptr, value_ptr,
-    input_stride_token: tl.int64, input_stride_head: tl.int64,
-    key_cache_ptr, value_cache_ptr,
-    cache_stride_block: tl.int64, cache_stride_slot: tl.int64,
+    key_ptr,
+    value_ptr,
+    input_stride_token: tl.int64,
+    input_stride_head: tl.int64,
+    key_cache_ptr,
+    value_cache_ptr,
+    cache_stride_block: tl.int64,
+    cache_stride_slot: tl.int64,
     cache_stride_head: tl.int64,
-    k_norms_ptr, v_norms_ptr,
-    norms_stride_block: tl.int64, norms_stride_slot: tl.int64,
+    k_norms_ptr,
+    v_norms_ptr,
+    norms_stride_block: tl.int64,
+    norms_stride_slot: tl.int64,
     norms_stride_head: tl.int64,
     slot_mapping_ptr,
-    boundaries_ptr, rotation_signs_ptr,
-    N_LEVELS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    boundaries_ptr,
+    rotation_signs_ptr,
+    N_LEVELS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
     """Triton encode kernel with sign-flip rotation (fast but less accurate)."""
@@ -1533,12 +1584,16 @@ def _turboquant_encode_signflip_kernel(
     block_offset = slot % BLOCK_SIZE
     offs = tl.arange(0, HEAD_DIM)
     src_offset = token_idx * input_stride_token + head_idx * input_stride_head
-    cache_offset = (block_idx * cache_stride_block
-                    + block_offset * cache_stride_slot
-                    + head_idx * cache_stride_head)
-    norms_offset = (block_idx * norms_stride_block
-                    + block_offset * norms_stride_slot
-                    + head_idx * norms_stride_head)
+    cache_offset = (
+        block_idx * cache_stride_block
+        + block_offset * cache_stride_slot
+        + head_idx * cache_stride_head
+    )
+    norms_offset = (
+        block_idx * norms_stride_block
+        + block_offset * norms_stride_slot
+        + head_idx * norms_stride_head
+    )
     signs = tl.load(rotation_signs_ptr + offs)
     k = tl.load(key_ptr + src_offset + offs).to(tl.float32)
     k_norm = tl.sqrt(tl.sum(k * k, axis=0) + 1e-12)
@@ -1584,12 +1639,11 @@ def turboquant_encode_ref(
     norms = torch.norm(tensor.float(), dim=-1)
     x_hat = tensor.float() / (norms.unsqueeze(-1) + 1e-10)
     R = codebook.rotation_matrix.to(tensor.device)
-    y = torch.einsum('...d,de->...e', x_hat, R.T)
+    y = torch.einsum("...d,de->...e", x_hat, R.T)
 
     indices = torch.zeros_like(y, dtype=torch.uint8)
     for i in range(codebook.n_levels - 1):
-        indices += (y > codebook.boundaries[i].to(tensor.device)).to(
-            torch.uint8)
+        indices += (y > codebook.boundaries[i].to(tensor.device)).to(torch.uint8)
 
     if packed and not codebook.byte_mode:
         indices = pack_nibbles(indices)
@@ -1627,7 +1681,7 @@ def turboquant_decode_ref(
 
     y_hat = centroids[indices.long()]
     # Inverse rotation: R^T @ y_hat, in batch = y_hat @ R
-    x_hat = torch.einsum('...d,de->...e', y_hat, R)
+    x_hat = torch.einsum("...d,de->...e", y_hat, R)
     x_recon = norms.unsqueeze(-1) * x_hat
 
     if squeeze:
@@ -1672,8 +1726,7 @@ def unpack_sign_bits(packed: torch.Tensor, head_dim: int) -> torch.Tensor:
     flat = packed.reshape(-1, n_bytes)
     n = flat.shape[0]
     bits = torch.arange(8, device=packed.device, dtype=torch.uint8)
-    unpacked = ((flat.unsqueeze(-1) >> bits[None, None, :]) & 1).reshape(
-        n, n_bytes * 8)
+    unpacked = ((flat.unsqueeze(-1) >> bits[None, None, :]) & 1).reshape(n, n_bytes * 8)
     # Trim to head_dim (may have padding bytes)
     unpacked = unpacked[:, :head_dim]
     sign_vec = 2.0 * unpacked.float() - 1.0
@@ -1708,7 +1761,7 @@ def turboquant_encode_qjl_ref(
     norms = torch.norm(tensor.float(), dim=-1)
     x_hat = tensor.float() / (norms.unsqueeze(-1) + 1e-10)
     R = codebook.rotation_matrix.to(device)
-    y = torch.einsum('...d,de->...e', x_hat, R.T)
+    y = torch.einsum("...d,de->...e", x_hat, R.T)
 
     # Scalar quantize
     indices = torch.zeros_like(y, dtype=torch.uint8)
@@ -1721,13 +1774,17 @@ def turboquant_encode_qjl_ref(
     residual = y - centroid_vals
 
     # sign(r) and mean(|r|)
-    sign_raw = (residual >= 0)
+    sign_raw = residual >= 0
     sign_bits = pack_sign_bits(sign_raw)
     res_scales = residual.abs().mean(dim=-1)
 
     if squeeze:
-        return (indices.squeeze(1), norms.squeeze(1),
-                sign_bits.squeeze(1), res_scales.squeeze(1))
+        return (
+            indices.squeeze(1),
+            norms.squeeze(1),
+            sign_bits.squeeze(1),
+            res_scales.squeeze(1),
+        )
     return indices, norms, sign_bits, res_scales
 
 
@@ -1765,12 +1822,243 @@ def turboquant_decode_qjl_ref(
     y_hat = y_hat + res_scales.unsqueeze(-1) * sign_vec
 
     # Inverse rotation: R^T @ y_hat, in batch = y_hat @ R
-    x_hat = torch.einsum('...d,de->...e', y_hat, R)
+    x_hat = torch.einsum("...d,de->...e", y_hat, R)
     x_recon = norms.unsqueeze(-1) * x_hat
 
     if squeeze:
         return x_recon.squeeze(1).to(output_dtype)
     return x_recon.to(output_dtype)
+
+
+# ============================================================================
+# Single-tensor encode/decode (for standalone backend with separate K/V codebooks)
+# ============================================================================
+
+
+def turboquant_encode_single(
+    tensor: torch.Tensor,
+    cache: torch.Tensor,
+    norms_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    codebook: TurboQuantCodebook,
+    signs_cache: torch.Tensor | None = None,
+    res_scales_cache: torch.Tensor | None = None,
+) -> None:
+    """Encode a single tensor (K or V) and scatter into its cache half.
+
+    This is the same algorithm as turboquant_reshape_and_cache but for
+    one tensor at a time, allowing different codebooks for K and V.
+    """
+    num_tokens = tensor.shape[0]
+    if num_tokens == 0:
+        return
+
+    valid = slot_mapping >= 0
+    if not valid.any():
+        return
+
+    valid_slots = slot_mapping[valid]
+    qjl = codebook.qjl
+    R_T = codebook.rotation_matrix_T
+
+    x = tensor[valid].float()
+    nrm = x.norm(dim=-1)
+    x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
+    orig_shape = x_hat.shape
+    y = (x_hat.reshape(-1, orig_shape[-1]) @ R_T).reshape(orig_shape)
+
+    n_valid = x.shape[0]
+    n_heads = x.shape[1]
+    log2_levels = math.ceil(math.log2(max(codebook.n_levels, 2)))
+
+    if n_valid > 0:
+        grid = (n_valid, n_heads)
+        if codebook.byte_mode:
+            _turboquant_encode_byte_kernel[grid](
+                y,
+                y.stride(0),
+                y.stride(1),
+                y.stride(2),
+                cache,
+                cache.stride(0),
+                cache.stride(1),
+                cache.stride(2),
+                cache.stride(3),
+                norms_cache,
+                norms_cache.stride(0),
+                norms_cache.stride(1),
+                norms_cache.stride(2),
+                nrm,
+                nrm.stride(0),
+                nrm.stride(1),
+                valid_slots,
+                codebook.boundaries,
+                codebook.centroids,
+                signs_cache if qjl else cache,
+                signs_cache.stride(0) if qjl else 0,
+                signs_cache.stride(1) if qjl else 0,
+                signs_cache.stride(2) if qjl else 0,
+                signs_cache.stride(3) if qjl else 0,
+                res_scales_cache if qjl else norms_cache,
+                res_scales_cache.stride(0) if qjl else 0,
+                res_scales_cache.stride(1) if qjl else 0,
+                res_scales_cache.stride(2) if qjl else 0,
+                BLOCK_SIZE=cache.shape[1],
+                HEAD_DIM=codebook.head_dim,
+                N_LEVELS=codebook.n_levels,
+                QJL_ENABLED=qjl,
+                SIGN_BYTES=(codebook.head_dim + 7) // 8 if qjl else 1,
+                LOG2_LEVELS=log2_levels,
+            )
+        else:
+            hd = codebook.head_dim
+            _turboquant_encode_packed_kernel[grid](
+                y,
+                y.stride(0),
+                y.stride(1),
+                y.stride(2),
+                cache,
+                cache.stride(0),
+                cache.stride(1),
+                cache.stride(2),
+                cache.stride(3),
+                norms_cache,
+                norms_cache.stride(0),
+                norms_cache.stride(1),
+                norms_cache.stride(2),
+                nrm,
+                nrm.stride(0),
+                nrm.stride(1),
+                valid_slots,
+                codebook.boundaries,
+                codebook.centroids,
+                signs_cache if qjl else cache,
+                signs_cache.stride(0) if qjl else 0,
+                signs_cache.stride(1) if qjl else 0,
+                signs_cache.stride(2) if qjl else 0,
+                signs_cache.stride(3) if qjl else 0,
+                res_scales_cache if qjl else norms_cache,
+                res_scales_cache.stride(0) if qjl else 0,
+                res_scales_cache.stride(1) if qjl else 0,
+                res_scales_cache.stride(2) if qjl else 0,
+                BLOCK_SIZE=cache.shape[1],
+                HEAD_DIM=hd,
+                N_LEVELS=codebook.n_levels,
+                HALF_DIM=hd // 2,
+                QJL_ENABLED=qjl,
+                SIGN_BYTES_HALF=(hd // 2 + 7) // 8 if qjl else 1,
+                LOG2_LEVELS=log2_levels,
+            )
+
+
+def turboquant_dequant_single(
+    cache: torch.Tensor,
+    norms: torch.Tensor,
+    staging: torch.Tensor,
+    codebook: TurboQuantCodebook,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks_per_seq: int,
+    signs: torch.Tensor | None = None,
+    res_scales: torch.Tensor | None = None,
+    dirty_blocks: torch.Tensor | None = None,
+) -> None:
+    """Decompress a single cache half (K or V) to bf16 staging buffer."""
+    num_seqs = block_table.shape[0]
+    if num_seqs == 0:
+        return
+
+    dev = cache.device
+    centroids = codebook.centroids
+    if centroids.device != dev:
+        centroids = centroids.to(dev, non_blocking=True)
+
+    qjl = codebook.qjl
+    nkv = cache.shape[2]
+    block_size = cache.shape[1]
+    dirty_check = dirty_blocks is not None
+    grid = (num_seqs * max_blocks_per_seq, nkv)
+
+    if codebook.byte_mode:
+        _turboquant_dequant_byte_kernel[grid](
+            cache,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            cache.stride(3),
+            norms,
+            norms.stride(0),
+            norms.stride(1),
+            norms.stride(2),
+            signs if qjl else cache,
+            signs.stride(0) if qjl else 0,
+            signs.stride(1) if qjl else 0,
+            signs.stride(2) if qjl else 0,
+            signs.stride(3) if qjl else 0,
+            res_scales if qjl else norms,
+            res_scales.stride(0) if qjl else 0,
+            res_scales.stride(1) if qjl else 0,
+            res_scales.stride(2) if qjl else 0,
+            centroids,
+            block_table,
+            block_table.stride(0),
+            block_table.stride(1),
+            seq_lens,
+            staging,
+            staging.stride(0),
+            staging.stride(1),
+            staging.stride(2),
+            staging.stride(3),
+            max_blocks_per_seq,
+            num_seqs,
+            dirty_blocks if dirty_check else seq_lens,
+            BLOCK_SIZE=block_size,
+            HEAD_DIM=codebook.head_dim,
+            QJL_ENABLED=qjl,
+            SIGN_BYTES=(codebook.head_dim + 7) // 8 if qjl else 1,
+            DIRTY_CHECK=dirty_check,
+        )
+    else:
+        hd = codebook.head_dim
+        _turboquant_dequant_nibble_kernel[grid](
+            cache,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            cache.stride(3),
+            norms,
+            norms.stride(0),
+            norms.stride(1),
+            norms.stride(2),
+            signs if qjl else cache,
+            signs.stride(0) if qjl else 0,
+            signs.stride(1) if qjl else 0,
+            signs.stride(2) if qjl else 0,
+            signs.stride(3) if qjl else 0,
+            res_scales if qjl else norms,
+            res_scales.stride(0) if qjl else 0,
+            res_scales.stride(1) if qjl else 0,
+            res_scales.stride(2) if qjl else 0,
+            centroids,
+            block_table,
+            block_table.stride(0),
+            block_table.stride(1),
+            seq_lens,
+            staging,
+            staging.stride(0),
+            staging.stride(1),
+            staging.stride(2),
+            staging.stride(3),
+            max_blocks_per_seq,
+            num_seqs,
+            dirty_blocks if dirty_check else seq_lens,
+            BLOCK_SIZE=block_size,
+            HEAD_DIM=hd,
+            HALF_DIM=hd // 2,
+            QJL_ENABLED=qjl,
+            SIGN_BYTES_HALF=(hd // 2 + 7) // 8 if qjl else 1,
+            DIRTY_CHECK=dirty_check,
+        )
 
 
 # Keep old name for backward compat

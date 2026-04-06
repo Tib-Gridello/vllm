@@ -59,10 +59,13 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "turboquant":
-        import vllm.envs as envs
-        bits = envs.VLLM_TURBOQUANT_BITS
-        if bits > 0 and bits <= 4:
+    if kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq-"):
+        from vllm.v1.attention.backends.turboquant_config import (
+            parse_tq_preset,
+        )
+        preset = parse_tq_preset(kv_cache_dtype)
+        # Use nibble mode if both K and V are <= 4-bit
+        if preset.k_bits <= 4 and preset.v_bits <= 4:
             return KVQuantMode.TURBOQUANT
         return KVQuantMode.TURBOQUANT_BYTE
     if kv_cache_dtype.startswith("fp8"):
@@ -142,20 +145,18 @@ class AttentionSpec(KVCacheSpec):
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
-        # TurboQuant norms: one float32 per (slot, head) stored as inline
-        # padding in the packed cache, same pattern as per-token-head scales.
+        # TurboQuant with old env-var path: add norms + optional QJL.
         if self.kv_quant_mode.is_turboquant:
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
-            # QJL: sign bits + residual scale, also inline in the cache dim.
             import vllm.envs as envs
             if envs.VLLM_TURBOQUANT_QJL:
                 from vllm.v1.attention.ops.turboquant import sign_bytes_padded
-                # sign bits: padded d/8 bytes + res_scale: 4 bytes, per KV per slot per head
+                sb = sign_bytes_padded(self.head_size)
                 real_page_size += (
                     2 * self.block_size * self.num_kv_heads
-                    * (sign_bytes_padded(self.head_size) + get_dtype_size(torch.float32))
+                    * (sb + get_dtype_size(torch.float32))
                 )
         if self.page_size_padded is not None:
             assert self.page_size_padded >= real_page_size

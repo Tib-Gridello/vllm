@@ -556,6 +556,25 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            # TurboQuant presets: padded cache dim > model head_size.
+            # Tell the allocator the true page size via page_size_padded.
+            tq_padded: int | None = None
+            if (
+                hasattr(self, "kv_cache_dtype")
+                and isinstance(self.kv_cache_dtype, str)
+                and (
+                    self.kv_cache_dtype.startswith("tq-")
+                    or self.kv_cache_dtype == "turboquant"
+                )
+            ):
+                from vllm.v1.attention.backends.turboquant_config import (
+                    parse_tq_preset,
+                )
+                preset = parse_tq_preset(self.kv_cache_dtype)
+                padded_dim = preset.padded_cache_dim(self.head_size)
+                tq_padded = (
+                    2 * block_size * self.num_kv_heads * padded_dim
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -563,6 +582,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                page_size_padded=tq_padded,
             )
 
 

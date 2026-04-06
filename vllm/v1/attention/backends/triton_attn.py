@@ -21,7 +21,6 @@ from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import (
     get_dtype_size,
     is_quantized_kv_cache,
-    is_turboquant_kv_cache,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -42,7 +41,6 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    KVQuantMode,
     get_kv_quant_mode,
     kv_cache_uses_per_token_head_scales,
 )
@@ -282,7 +280,6 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e5m2",
         "int8_per_token_head",
         "fp8_per_token_head",
-        "turboquant",
     ]
 
     @staticmethod
@@ -315,53 +312,6 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        if is_turboquant_kv_cache(cache_dtype_str):
-            import vllm.envs as envs
-            scale_pad = get_dtype_size(torch.float32)  # 4 uint8 = 1 float32
-
-            # Outlier mode: mixed-precision cache layout
-            outlier_str = envs.VLLM_TURBOQUANT_OUTLIER_BITS
-            if outlier_str:
-                from vllm.v1.attention.ops.turboquant import (
-                    OutlierChannelConfig,
-                )
-                parts = outlier_str.split(",")
-                oc = OutlierChannelConfig(
-                    head_dim=head_size,
-                    outlier_bits=int(parts[0]),
-                    regular_bits=int(parts[1]),
-                    device="cpu",
-                )
-                padded = oc.cache_bytes_per_head()
-                return (num_blocks, 2, block_size, num_kv_heads,
-                        padded)
-
-            bits = envs.VLLM_TURBOQUANT_BITS
-            if bits > 0 and bits <= 4:
-                # Nibble-packed: head_size//2 data bytes + 4 for norm
-                data_dim = head_size // 2
-                if envs.VLLM_TURBOQUANT_QJL:
-                    from vllm.v1.attention.ops.turboquant import (
-                        sign_bytes_padded,
-                    )
-                    qjl_pad = sign_bytes_padded(head_size) + scale_pad
-                    return (num_blocks, 2, block_size, num_kv_heads,
-                            data_dim + scale_pad + qjl_pad)
-                return (num_blocks, 2, block_size, num_kv_heads,
-                        data_dim + scale_pad)
-            else:
-                # Byte storage: head_size data bytes + 4 for norm
-                data_dim = head_size
-                if envs.VLLM_TURBOQUANT_QJL:
-                    # QJL: also store sign bits + res_scale
-                    from vllm.v1.attention.ops.turboquant import (
-                        sign_bytes_padded,
-                    )
-                    qjl_pad = sign_bytes_padded(head_size) + scale_pad
-                    return (num_blocks, 2, block_size, num_kv_heads,
-                            data_dim + scale_pad + qjl_pad)
-                return (num_blocks, 2, block_size, num_kv_heads,
-                        data_dim + scale_pad)
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
             # Pad head_size by sizeof(float32)/sizeof(cache_dtype) so
             # the per-head scale fits inline.  The backend extracts
@@ -437,154 +387,6 @@ class TritonAttentionImpl(AttentionImpl):
     # Per-token-head quant: scale views carved from inline head padding.
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
-    # TurboQuant: norm views carved from inline head padding (same pattern).
-    _tq_k_norms: torch.Tensor | None = None
-    _tq_v_norms: torch.Tensor | None = None
-    # QJL: sign-bit and residual-scale views.
-    _tq_k_signs: torch.Tensor | None = None
-    _tq_v_signs: torch.Tensor | None = None
-    _tq_k_res_scales: torch.Tensor | None = None
-    _tq_v_res_scales: torch.Tensor | None = None
-    # Dequant-first staging buffers (bf16, sized for active batch)
-    _tq_dequant_first: bool = False
-    _tq_staging_key: torch.Tensor | None = None
-    _tq_staging_val: torch.Tensor | None = None
-    _tq_staging_block_table: torch.Tensor | None = None
-    _tq_max_blocks_per_seq: int = 0
-    # Incremental dequant: per-physical-block dirty flags.
-    # When set, only dirty blocks are decompressed; clean blocks keep
-    # their staging data from the previous step.
-    _tq_dirty_blocks: torch.Tensor | None = None
-    _tq_staging_valid: bool = False  # True after first full dequant
-
-    def _ensure_tq_norm_caches(self, kv_cache: torch.Tensor) -> None:
-        """Extract per-head norm/sign/res_scale views from padded cache dim.
-
-        The KV cache shape is
-        ``(num_blocks, 2, block_size, nkv, padded_dim)`` where:
-
-        * **byte mode (no QJL):** ``padded_dim = head_size + 4`` —
-          the last 4 uint8 bytes of each head hold one float32 norm.
-        * **byte mode + QJL:** ``padded_dim = head_size + 4 + sign_bytes + 4``
-          — layout is ``[indices | L2 norm | sign bits | res_scale]``.
-
-        Creates float32 strided views for norms and (when QJL) res_scales,
-        and a uint8 strided view for sign bytes.
-        """
-        if self._tq_k_norms is not None:
-            return
-
-        num_blocks, _, block_size, nkv, padded_dim = kv_cache.shape
-        dtype_sz = kv_cache.element_size()  # 1 for uint8
-
-        # Determine head_size from codebook (set during __init__)
-        head_size = self._tq_codebook.head_dim
-        qjl = self._tq_codebook.qjl
-
-        raw = kv_cache.untyped_storage()
-        base_f32 = torch.tensor(
-            [], dtype=torch.float32, device=kv_cache.device
-        ).set_(raw)
-
-        kv_half_bytes = block_size * nkv * padded_dim * dtype_sz
-        full_block_f32 = 2 * kv_half_bytes // 4
-        slot_f32 = nkv * padded_dim * dtype_sz // 4
-        head_f32 = padded_dim * dtype_sz // 4
-        # L2 norm sits right after the index data
-        # Index data size: head_size for byte mode, head_size//2 for nibble
-        idx_data_bytes = head_size if self._tq_codebook.byte_mode else head_size // 2
-        norm_off_f32 = idx_data_bytes * dtype_sz // 4
-
-        # K norms: kv_half=0
-        self._tq_k_norms = torch.as_strided(
-            base_f32,
-            size=(num_blocks, block_size, nkv),
-            stride=(full_block_f32, slot_f32, head_f32),
-            storage_offset=norm_off_f32,
-        )
-
-        # V norms: kv_half=1
-        v_base_f32 = kv_half_bytes // 4
-        self._tq_v_norms = torch.as_strided(
-            base_f32,
-            size=(num_blocks, block_size, nkv),
-            stride=(full_block_f32, slot_f32, head_f32),
-            storage_offset=v_base_f32 + norm_off_f32,
-        )
-
-        # Zero norms — critical because the profiling/warmup pass may have
-        # written stale data to these padding bytes.
-        self._tq_k_norms.fill_(0.0)
-        self._tq_v_norms.fill_(0.0)
-
-        # QJL views: sign bits (uint8) and res_scale (float32)
-        if qjl:
-            from vllm.v1.attention.ops.turboquant import sign_bytes_padded
-            sbytes = sign_bytes_padded(head_size)
-
-            # --- Sign bits: uint8 view ---
-            # Offset in bytes from start of each head's data:
-            sign_byte_off = idx_data_bytes + 4  # after indices + L2 norm
-            base_u8 = torch.tensor(
-                [], dtype=torch.uint8, device=kv_cache.device
-            ).set_(raw)
-            kv_half_bytes_u8 = kv_half_bytes
-            full_block_u8 = 2 * kv_half_bytes_u8
-            slot_u8 = nkv * padded_dim
-            head_u8 = padded_dim
-
-            # K signs (kv_half=0)
-            self._tq_k_signs = torch.as_strided(
-                base_u8,
-                size=(num_blocks, block_size, nkv, sbytes),
-                stride=(full_block_u8, slot_u8, head_u8, 1),
-                storage_offset=sign_byte_off,
-            )
-            # V signs (kv_half=1)
-            self._tq_v_signs = torch.as_strided(
-                base_u8,
-                size=(num_blocks, block_size, nkv, sbytes),
-                stride=(full_block_u8, slot_u8, head_u8, 1),
-                storage_offset=kv_half_bytes_u8 + sign_byte_off,
-            )
-            self._tq_k_signs.fill_(0)
-            self._tq_v_signs.fill_(0)
-
-            # --- Residual scale: float32 view ---
-            res_scale_byte_off = idx_data_bytes + 4 + sbytes
-            res_scale_off_f32 = res_scale_byte_off // 4
-
-            self._tq_k_res_scales = torch.as_strided(
-                base_f32,
-                size=(num_blocks, block_size, nkv),
-                stride=(full_block_f32, slot_f32, head_f32),
-                storage_offset=res_scale_off_f32,
-            )
-            self._tq_v_res_scales = torch.as_strided(
-                base_f32,
-                size=(num_blocks, block_size, nkv),
-                stride=(full_block_f32, slot_f32, head_f32),
-                storage_offset=v_base_f32 + res_scale_off_f32,
-            )
-            self._tq_k_res_scales.fill_(0.0)
-            self._tq_v_res_scales.fill_(0.0)
-
-    def _reset_tq_norms(self) -> None:
-        """Invalidate norm views so they are recreated and re-zeroed.
-
-        The profiling pass may write stale data to the cache's norm padding.
-        Simply filling may not work if the storage changed, so we force view
-        recreation by setting the cached views to None.
-        """
-        self._tq_k_norms = None
-        self._tq_v_norms = None
-        self._tq_k_signs = None
-        self._tq_v_signs = None
-        self._tq_k_res_scales = None
-        self._tq_v_res_scales = None
-        # Invalidate incremental dequant state
-        self._tq_dirty_blocks = None
-        self._tq_staging_valid = False
 
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
@@ -693,104 +495,6 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
-        self._is_turboquant = self._kv_quant_mode.is_turboquant
-        self._tq_outlier_config = None
-        if self._is_turboquant:
-            import vllm.envs as envs
-            from vllm.v1.attention.ops.turboquant import TurboQuantCodebook
-            bits = envs.VLLM_TURBOQUANT_BITS
-            if bits == 0:  # auto-select based on head dimension
-                bits = 4 if head_size >= 256 else 8
-            qjl = envs.VLLM_TURBOQUANT_QJL
-            self._tq_codebook = TurboQuantCodebook(
-                n_bits=bits,
-                head_dim=head_size,
-                device="cpu",  # moved to GPU on first use
-                qjl=qjl,
-            )
-            self._tq_dequant_first = envs.VLLM_TURBOQUANT_DEQUANT_FIRST
-
-            # Outlier channel mixed-precision (e.g., "4,2" for 2.5-bit)
-            outlier_str = envs.VLLM_TURBOQUANT_OUTLIER_BITS
-            if outlier_str:
-                from vllm.v1.attention.ops.turboquant import (
-                    OutlierChannelConfig,
-                )
-                parts = outlier_str.split(",")
-                out_bits = int(parts[0])
-                reg_bits = int(parts[1])
-                self._tq_outlier_config = OutlierChannelConfig(
-                    head_dim=head_size,
-                    outlier_ratio=0.25,
-                    outlier_bits=out_bits,
-                    regular_bits=reg_bits,
-                    device="cpu",
-                    qjl=False,  # QJL off for mixed-precision
-                )
-
-    def _ensure_tq_staging(
-        self,
-        kv_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        seq_lens: torch.Tensor | None = None,
-    ) -> None:
-        """Lazily allocate bf16 staging buffers for dequant-first path.
-
-        Staging layout: [num_seqs * max_bps, block_size, nkv, head_dim]
-        Block table remap: staging_bt[s, p] = s * max_bps + p
-
-        Uses actual max(seq_lens) to compute max_bps rather than the
-        block_table width (which reflects max_model_len and can be huge).
-        """
-        _, _, block_size_cache, nkv, _ = kv_cache.shape
-
-        # Compute max_blocks_per_seq from actual sequence lengths
-        bt_width = block_table.shape[1]
-        if seq_lens is not None and seq_lens.numel() > 0:
-            max_sl = seq_lens.max().item()
-            max_bps = min(
-                (max_sl + block_size_cache - 1) // block_size_cache,
-                bt_width,
-            )
-        else:
-            max_bps = bt_width
-        # Ensure at least 1 block per seq
-        max_bps = max(max_bps, 1)
-        num_seqs = block_table.shape[0]
-        needed = num_seqs * max_bps
-
-        # Check if staging is already big enough
-        if (self._tq_staging_key is not None
-                and self._tq_staging_key.shape[0] >= needed
-                and self._tq_max_blocks_per_seq == max_bps):
-            # Rebuild staging block_table if num_seqs changed
-            if (self._tq_staging_block_table is None
-                    or self._tq_staging_block_table.shape[0] < num_seqs):
-                self._tq_staging_block_table = torch.arange(
-                    0, needed,
-                    dtype=block_table.dtype,
-                    device=block_table.device,
-                ).reshape(num_seqs, max_bps)
-            return
-
-        head_dim = self._tq_codebook.head_dim
-        device = kv_cache.device
-
-        self._tq_max_blocks_per_seq = max_bps
-        self._tq_staging_key = torch.zeros(
-            (needed, block_size_cache, nkv, head_dim),
-            dtype=torch.bfloat16, device=device,
-        )
-        self._tq_staging_val = torch.zeros(
-            (needed, block_size_cache, nkv, head_dim),
-            dtype=torch.bfloat16, device=device,
-        )
-        self._tq_staging_block_table = torch.arange(
-            0, needed,
-            dtype=block_table.dtype, device=device,
-        ).reshape(num_seqs, max_bps)
-        # Staging was reallocated → force full dequant on next forward
-        self._tq_staging_valid = False
 
     def forward(
         self,
@@ -825,10 +529,7 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
         if attn_metadata is None:
-            # Profiling run.  Mark that norms need clearing before first
-            # real inference (warmup writes stale data to cache padding).
-            if self._is_turboquant:
-                self._tq_norms_dirty = True
+            # Profiling run.
             return output.fill_(0)
 
         assert attn_metadata.use_cascade is False
@@ -857,113 +558,8 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        # TurboQuant: packed uint8 indices with inline float32 norms.
-        tq_centroids = None
-        tq_rotation_signs = None
-        tq_k_norms = None
-        tq_v_norms = None
-        tq_k_res_scales = None
-        tq_v_res_scales = None
-        kv_quant_mode_for_attn = self._kv_quant_mode
-        _tq_skip_output_rotation = False
-        if self._is_turboquant:
-            self._ensure_tq_norm_caches(kv_cache)
-            cb = self._tq_codebook
-            dev = kv_cache.device
-            k_descale = None
-            v_descale = None
-            k_scale_cache = None
-            v_scale_cache = None
-
-            if self._tq_outlier_config is not None:
-                # --- OUTLIER MIXED-PRECISION PATH ---
-                # Dequant outputs in ORIGINAL space → no rotation needed
-                from vllm.v1.attention.ops.turboquant import (
-                    outlier_dequant_paged,
-                )
-                self._ensure_tq_staging(
-                    kv_cache, attn_metadata.block_table,
-                    attn_metadata.seq_lens)
-                key_cache_tq, value_cache_tq = kv_cache.unbind(1)
-                outlier_dequant_paged(
-                    key_cache_tq, value_cache_tq,
-                    self._tq_k_norms, self._tq_v_norms,
-                    self._tq_staging_key, self._tq_staging_val,
-                    self._tq_outlier_config.to(dev),
-                    attn_metadata.block_table,
-                    attn_metadata.seq_lens,
-                    self._tq_max_blocks_per_seq,
-                )
-                key_cache = self._tq_staging_key
-                value_cache = self._tq_staging_val
-                kv_quant_mode_for_attn = KVQuantMode.NONE
-                _tq_skip_output_rotation = True
-                # No Q rotation needed (KV in original space)
-                query = query[:num_actual_tokens]
-            else:
-                # --- UNIFORM BIT-WIDTH TQ ---
-                # Rotate Q by R (common to fused and dequant-first)
-                from vllm.v1.attention.ops.turboquant import rotate_query
-                R_T = cb.rotation_matrix_T.to(dev, non_blocking=True)
-                query = rotate_query(query[:num_actual_tokens], R_T)
-
-                # Auto-select dequant-first vs fused based on context
-                use_dequant_first = (
-                    self._tq_dequant_first
-                    and attn_metadata.max_seq_len > 256
-                )
-
-                if use_dequant_first:
-                    # Decompress TQ → bf16 staging, standard attention.
-                    # TODO(turboquant): Incremental dequant is disabled
-                    # because per-physical-block dirty tracking is wrong
-                    # when batch composition changes (new sequences get
-                    # stale staging data for prefix-cached blocks).
-                    # Need per-staging-position tracking instead.
-                    from vllm.v1.attention.ops.turboquant import (
-                        turboquant_dequant_paged,
-                    )
-                    self._ensure_tq_staging(
-                        kv_cache, attn_metadata.block_table,
-                        attn_metadata.seq_lens)
-                    key_cache_tq, value_cache_tq = kv_cache.unbind(1)
-                    turboquant_dequant_paged(
-                        key_cache_tq, value_cache_tq,
-                        self._tq_k_norms, self._tq_v_norms,
-                        self._tq_staging_key, self._tq_staging_val,
-                        cb,
-                        attn_metadata.block_table,
-                        attn_metadata.seq_lens,
-                        self._tq_max_blocks_per_seq,
-                        k_signs=(self._tq_k_signs
-                                 if cb.qjl else None),
-                        v_signs=(self._tq_v_signs
-                                 if cb.qjl else None),
-                        k_res_scales=(self._tq_k_res_scales
-                                      if cb.qjl else None),
-                        v_res_scales=(self._tq_v_res_scales
-                                      if cb.qjl else None),
-                        # Always full dequant for correctness.
-                        # Incremental dequant needs per-staging-position
-                        # tracking, not per-physical-block.
-                        dirty_blocks=None,
-                    )
-                    key_cache = self._tq_staging_key
-                    value_cache = self._tq_staging_val
-                    kv_quant_mode_for_attn = KVQuantMode.NONE
-                else:
-                    # Fused inline dequant in attention kernel
-                    key_cache, value_cache = kv_cache.unbind(1)
-                    tq_centroids = cb.centroids.to(
-                        dev, non_blocking=True)
-                    tq_rotation_signs = None
-                    tq_k_norms = self._tq_k_norms
-                    tq_v_norms = self._tq_v_norms
-                    if cb.qjl:
-                        tq_k_res_scales = self._tq_k_res_scales
-                        tq_v_res_scales = self._tq_v_res_scales
         # Per-token-head quantized KV cache: use separate scale caches.
-        elif self._is_per_token_head_quant:
+        if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
             if key_cache.dtype == torch.uint8:
@@ -996,19 +592,7 @@ class TritonAttentionImpl(AttentionImpl):
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
-        # Dequant-first / outlier mode uses remapped staging block_table
-        _uses_staging = (
-            self._is_turboquant and (
-                self._tq_outlier_config is not None
-                or (self._tq_dequant_first
-                    and attn_metadata.max_seq_len > 256)
-            )
-        )
-        if _uses_staging:
-            num_seqs = attn_metadata.block_table.shape[0]
-            block_table = self._tq_staging_block_table[:num_seqs]
-        else:
-            block_table = attn_metadata.block_table
+        block_table = attn_metadata.block_table
 
         seq_threshold_3D = attn_metadata.seq_threshold_3D
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
@@ -1018,10 +602,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
-        # For TQ, query was already rotated and sliced above
-        q_for_attn = query if self._is_turboquant else query[:num_actual_tokens]
         unified_attention(
-            q=q_for_attn,
+            q=query[:num_actual_tokens],
             k=key_cache,
             v=value_cache,
             out=output[:num_actual_tokens],
@@ -1047,24 +629,10 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
-            kv_quant_mode=kv_quant_mode_for_attn,
+            kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
-            tq_centroids=tq_centroids,
-            tq_rotation_signs=tq_rotation_signs,
-            tq_k_norms=tq_k_norms,
-            tq_v_norms=tq_v_norms,
-            tq_k_res_scales=tq_k_res_scales,
-            tq_v_res_scales=tq_v_res_scales,
         )
-
-        # TQ: inverse-rotate attention output (V was in rotated space)
-        # Skip for outlier mode (dequant already outputs in original space)
-        if self._is_turboquant and not _tq_skip_output_rotation:
-            from vllm.v1.attention.ops.turboquant import inverse_rotate_output
-            R = self._tq_codebook.rotation_matrix.to(output.device)
-            out_slice = output[:num_actual_tokens]
-            out_slice.copy_(inverse_rotate_output(out_slice, R))
 
         return output
 
@@ -1127,64 +695,6 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
-        if self._is_turboquant:
-            # Invalidate norm views BEFORE recreating if dirty (warmup wrote
-            # stale data; views may point to old storage).
-            if getattr(self, '_tq_norms_dirty', False):
-                self._tq_norms_dirty = False
-                self._reset_tq_norms()  # sets _tq_k_norms = None
-            self._ensure_tq_norm_caches(kv_cache)  # recreates + fills 0
-            key_cache, value_cache = kv_cache.unbind(1)
-
-            if self._tq_outlier_config is not None:
-                from vllm.v1.attention.ops.turboquant import (
-                    outlier_reshape_and_cache,
-                )
-                outlier_reshape_and_cache(
-                    key, value,
-                    key_cache, value_cache,
-                    self._tq_k_norms, self._tq_v_norms,
-                    slot_mapping,
-                    self._tq_outlier_config.to(key.device),
-                )
-            else:
-                from vllm.v1.attention.ops.turboquant import (
-                    turboquant_reshape_and_cache,
-                )
-                turboquant_reshape_and_cache(
-                    key, value,
-                    key_cache, value_cache,
-                    self._tq_k_norms, self._tq_v_norms,
-                    slot_mapping, self._tq_codebook.to(key.device),
-                    k_signs=self._tq_k_signs,
-                    v_signs=self._tq_v_signs,
-                    k_res_scales=self._tq_k_res_scales,
-                    v_res_scales=self._tq_v_res_scales,
-                )
-
-            # Mark written blocks as dirty for incremental dequant.
-            if self._tq_dequant_first:
-                num_blocks = kv_cache.shape[0]
-                block_size = kv_cache.shape[2]
-                if self._tq_dirty_blocks is None:
-                    self._tq_dirty_blocks = torch.ones(
-                        num_blocks, dtype=torch.bool,
-                        device=kv_cache.device)
-                    self._tq_staging_valid = False
-                elif self._tq_dirty_blocks.shape[0] < num_blocks:
-                    # Grow array preserving old state; only new blocks
-                    # are marked dirty (old blocks may already be staged).
-                    old = self._tq_dirty_blocks
-                    self._tq_dirty_blocks = torch.ones(
-                        num_blocks, dtype=torch.bool,
-                        device=kv_cache.device)
-                    self._tq_dirty_blocks[:old.shape[0]] = old
-                    self._tq_staging_valid = False
-                valid = slot_mapping >= 0
-                if valid.any():
-                    dirty_blks = slot_mapping[valid] // block_size
-                    self._tq_dirty_blocks[dirty_blks] = True
-            return
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
