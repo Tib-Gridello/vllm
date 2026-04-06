@@ -5,16 +5,19 @@
 Implements PolarQuant from "TurboQuant: Online Vector Quantization with
 Near-optimal Distortion Rate" (arXiv:2504.19874).
 
+Architecture: fused attention — the Triton unified attention kernel reads
+compressed indices inline, looks up centroids, applies norms and QJL sign
+correction, and computes attention in a single pass. No staging buffer.
+
 Unique features over other TQ implementations:
 - Hadamard rotation (3pp MMLU improvement over random QR)
 - Sign correction (QJL variant, 1-bit residual per coordinate)
-- Outlier channel support (for sub-4-bit, the paper's sweet spot)
-- Dequant-first architecture (decompress → standard attention)
+- Fused decode (no decompression to bf16 staging)
 - Named presets via --kv-cache-dtype (e.g. tq-k8v8-qjl)
 
 Usage:
   vllm serve <model> --kv-cache-dtype tq-k8v8-qjl
-  vllm serve <model> --kv-cache-dtype tq-k4v4 --enforce-eager
+  vllm serve <model> --kv-cache-dtype tq-k4v4
 """
 
 from __future__ import annotations
@@ -186,17 +189,18 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
 
 class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
-    """TurboQuant attention: dequant-first for all paths.
+    """TurboQuant attention: fused decode with inline dequant.
 
     Encode (do_kv_cache_update):
       K/V → normalize → Hadamard rotate → quantize → pack → scatter
 
-    Decode (forward):
-      Cache → Triton dequant → bf16 staging → rotate Q → attention → inv-rotate
+    Forward (fused attention):
+      Rotate Q → unified_attention reads compressed cache inline
+      (centroid lookup + norm + QJL correction inside attention loop)
+      → inverse-rotate output
     """
 
-    # Lazy-initialized per-instance state (cache views are per-layer
-    # because they point into each layer's KV cache slice)
+    # Per-instance cache views (point into each layer's KV cache)
     _k_norms: torch.Tensor | None = None
     _v_norms: torch.Tensor | None = None
     _k_signs: torch.Tensor | None = None
@@ -204,13 +208,6 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _k_res_scales: torch.Tensor | None = None
     _v_res_scales: torch.Tensor | None = None
     _norms_dirty: bool = False
-
-    # Shared staging buffers — class-level, reused across all layers.
-    # Only one layer executes at a time, so a single pair suffices.
-    # This avoids allocating N_layers × num_blocks staging (which
-    # exhausts GPU memory and breaks CUDAGraph capture).
-    _shared_staging_key: ClassVar[torch.Tensor | None] = None
-    _shared_staging_val: ClassVar[torch.Tensor | None] = None
 
     def __init__(
         self,
@@ -245,7 +242,22 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         # Parse preset
         self._preset = parse_tq_preset(kv_cache_dtype)
 
-        # Create codebooks (separate for K and V to allow asymmetric bits)
+        # Fused kernel uses single KV_QUANT_MODE for both K and V
+        if self._preset.k_bits != self._preset.v_bits:
+            raise NotImplementedError(
+                "Fused TurboQuant attention requires symmetric K/V bits. "
+                f"Got k_bits={self._preset.k_bits}, "
+                f"v_bits={self._preset.v_bits}. "
+                "Use a symmetric preset like tq-k8v8 or tq-k4v4."
+            )
+
+        # KV quant mode for unified_attention
+        if self._preset.k_byte_mode:
+            self._kv_quant_mode = KVQuantMode.TURBOQUANT_BYTE
+        else:
+            self._kv_quant_mode = KVQuantMode.TURBOQUANT
+
+        # Create codebooks (separate rotations for K and V)
         from vllm.v1.attention.ops.turboquant import TurboQuantCodebook
 
         self._k_codebook = TurboQuantCodebook(
@@ -265,7 +277,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         logger.info(
             "TurboQuant backend: preset=%s, k_bits=%d, v_bits=%d, "
-            "qjl=%s, head_dim=%d, padded_dim=%d",
+            "qjl=%s, head_dim=%d, padded_dim=%d, fused=True",
             self._preset.name,
             self._preset.k_bits,
             self._preset.v_bits,
@@ -322,7 +334,18 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
                 sbytes = sign_bytes_padded(hd)
 
-                # Uint8 view for sign bits
+                # Float32 view for res_scale
+                res_off_f32 = (idx_bytes + 4 + sbytes) // 4
+                res_scales = torch.as_strided(
+                    base_f32,
+                    size=(num_blocks, block_size, nkv),
+                    stride=(full_block_f32, slot_f32, head_f32),
+                    storage_offset=kv_offset_f32 + res_off_f32,
+                )
+                res_scales.fill_(0.0)
+                setattr(self, f"{attr_prefix}_res_scales", res_scales)
+
+                # Uint8 view for sign bits (still needed for encode path)
                 base_u8 = torch.tensor(
                     [], dtype=torch.uint8, device=kv_cache.device
                 ).set_(raw)
@@ -338,17 +361,6 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
                 signs.fill_(0)
                 setattr(self, f"{attr_prefix}_signs", signs)
 
-                # Float32 view for res_scale
-                res_off_f32 = (idx_bytes + 4 + sbytes) // 4
-                res_scales = torch.as_strided(
-                    base_f32,
-                    size=(num_blocks, block_size, nkv),
-                    stride=(full_block_f32, slot_f32, head_f32),
-                    storage_offset=kv_offset_f32 + res_off_f32,
-                )
-                res_scales.fill_(0.0)
-                setattr(self, f"{attr_prefix}_res_scales", res_scales)
-
     def _reset_cache_views(self) -> None:
         self._k_norms = None
         self._v_norms = None
@@ -357,45 +369,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._k_res_scales = None
         self._v_res_scales = None
 
-    @classmethod
-    def _ensure_staging(
-        cls,
-        kv_cache: torch.Tensor,
-        head_dim: int,
-    ) -> None:
-        """Pre-allocate shared bf16 staging buffers for dequant-first path.
-
-        Class-level: one pair of buffers shared by all layers (only one
-        layer is active at a time). Avoids N_layers × num_blocks memory
-        which would exhaust GPU memory and break CUDAGraph capture.
-        """
-        num_blocks = kv_cache.shape[0]
-        block_size = kv_cache.shape[2]
-        nkv = kv_cache.shape[3]
-
-        if (
-            cls._shared_staging_key is not None
-            and cls._shared_staging_key.shape[0] >= num_blocks
-        ):
-            return
-
-        device = kv_cache.device
-
-        cls._shared_staging_key = torch.zeros(
-            (num_blocks, block_size, nkv, head_dim),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        cls._shared_staging_val = torch.zeros(
-            (num_blocks, block_size, nkv, head_dim),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-
-    # No staging block table needed: staging is indexed by physical block
-    # number (same as kv_cache), so attention uses the original block_table.
-
-    # ----- Forward -----
+    # ----- Forward (fused attention) -----
 
     def forward(
         self,
@@ -424,64 +398,31 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         self._ensure_cache_views(kv_cache)
 
-        # --- Decompress TQ cache → bf16 staging ---
         from vllm.v1.attention.ops.turboquant import (
             inverse_rotate_output,
             rotate_query,
-            turboquant_dequant_single,
         )
 
         dev = kv_cache.device
         key_cache, value_cache = kv_cache.unbind(1)
 
-        assert self._k_norms is not None
-        assert self._v_norms is not None
-        assert self._shared_staging_key is not None
-        assert self._shared_staging_val is not None
-
-        max_blocks_per_seq = attn_metadata.block_table.shape[1]
-
+        # Rotate query by K's rotation matrix (external, not in kernel)
         k_cb = self._k_codebook.to(dev)
-        turboquant_dequant_single(
-            key_cache,
-            self._k_norms,
-            self._shared_staging_key,
-            k_cb,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            max_blocks_per_seq,
-            signs=self._k_signs if k_cb.qjl else None,
-            res_scales=self._k_res_scales if k_cb.qjl else None,
-        )
-
-        v_cb = self._v_codebook.to(dev)
-        turboquant_dequant_single(
-            value_cache,
-            self._v_norms,
-            self._shared_staging_val,
-            v_cb,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            max_blocks_per_seq,
-            signs=self._v_signs if v_cb.qjl else None,
-            res_scales=self._v_res_scales if v_cb.qjl else None,
-        )
-
-        # Rotate query by K's rotation matrix
         k_R_T = k_cb.rotation_matrix_T
         q_rot = rotate_query(query[:num_actual_tokens], k_R_T)
 
-        # Standard Triton unified attention on decompressed bf16 staging.
-        # Staging is indexed by physical block (same as kv_cache), so we
-        # pass the original block_table directly.
+        # Fused attention: unified_attention reads compressed cache inline,
+        # looks up centroids, applies norms and QJL correction — no staging.
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
         )
 
+        v_cb = self._v_codebook.to(dev)
+
         unified_attention(
             q=q_rot,
-            k=self._shared_staging_key,
-            v=self._shared_staging_val,
+            k=key_cache,
+            v=value_cache,
             out=output[:num_actual_tokens],
             cu_seqlens_q=attn_metadata.query_start_loc,
             max_seqlen_q=attn_metadata.max_query_len,
@@ -497,7 +438,12 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             q_descale=None,
             k_descale=None,
             v_descale=None,
-            kv_quant_mode=KVQuantMode.NONE,
+            kv_quant_mode=self._kv_quant_mode,
+            tq_centroids=k_cb.centroids,
+            tq_k_norms=self._k_norms,
+            tq_v_norms=self._v_norms,
+            tq_k_res_scales=self._k_res_scales if self._preset.qjl else None,
+            tq_v_res_scales=self._v_res_scales if self._preset.qjl else None,
         )
 
         # Inverse-rotate output (V was in rotated space)
@@ -521,8 +467,6 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._norms_dirty = False
             self._reset_cache_views()
         self._ensure_cache_views(kv_cache)
-        # Pre-allocate shared staging (class-level, one pair for all layers).
-        self._ensure_staging(kv_cache, self.head_size)
 
         from vllm.v1.attention.ops.turboquant import turboquant_encode_single
 
