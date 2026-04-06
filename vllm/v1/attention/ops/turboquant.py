@@ -199,23 +199,38 @@ def _hadamard_matrix(d: int) -> torch.Tensor:
 
 
 def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
-    """Randomized Hadamard rotation matrix.
+    """Orthogonal rotation matrix for TurboQuant.
 
-    Uses D @ H where D is a random diagonal ±1 matrix and H is the
-    Walsh-Hadamard matrix.  This spreads energy uniformly across
-    coordinates (no pathological data-rotation alignments), unlike
-    random QR which can create extreme coordinate values.
+    For power-of-2 dimensions: randomized Hadamard (D @ H) — optimal for
+    spreading energy uniformly across coordinates.
+
+    For non-power-of-2 dimensions (e.g., outlier subgroups with d=96):
+    random orthogonal via QR decomposition. Truncating a Hadamard matrix
+    to non-power-of-2 size destroys orthogonality.
 
     Returns:
         R: (d, d) orthogonal matrix where R @ R^T = I
     """
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    signs = (
-        torch.randint(0, 2, (d,), generator=gen, device="cpu", dtype=torch.float32) * 2
-        - 1
-    )
-    H = _hadamard_matrix(d)
-    return signs.unsqueeze(1) * H
+
+    if d > 0 and (d & (d - 1)) == 0:
+        # Power of 2: use randomized Hadamard
+        signs = (
+            torch.randint(
+                0, 2, (d,), generator=gen, device="cpu", dtype=torch.float32
+            )
+            * 2
+            - 1
+        )
+        H = _hadamard_matrix(d)
+        return signs.unsqueeze(1) * H
+    else:
+        # Non-power-of-2: random orthogonal via QR
+        A = torch.randn(d, d, generator=gen, device="cpu")
+        Q, R = torch.linalg.qr(A)
+        # Fix sign ambiguity to get a proper rotation (det=+1 or -1 consistently)
+        Q = Q * torch.sign(torch.diag(R)).unsqueeze(0)
+        return Q
 
 
 # ============================================================================
