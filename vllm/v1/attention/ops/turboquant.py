@@ -58,6 +58,93 @@ def qjl_padded_dim(head_dim: int) -> int:
 # ============================================================================
 
 
+def _compute_exact_centroids(
+    d: int,
+    n_bits: int,
+    n_iters: int = 100,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact Lloyd-Max centroids via numerical integration on Beta((d-1)/2).
+
+    Uses scipy.integrate.quad for exact centroid computation instead of
+    Monte Carlo sampling. This eliminates codebook noise from finite samples.
+
+    Falls back to Monte Carlo if scipy is unavailable.
+    """
+    import numpy as np
+    from scipy import integrate
+    from scipy.stats import beta as beta_dist
+
+    n_levels = 2**n_bits
+    alpha = (d - 1) / 2.0
+
+    # Beta(alpha, alpha) PDF on [-1, 1], mapped from standard [0, 1]
+    def pdf(x: float) -> float:
+        return float(beta_dist.pdf((x + 1) / 2, alpha, alpha) / 2)
+
+    # Initialize centroids at distribution quantiles
+    quantiles = np.linspace(0.5 / n_levels, 1 - 0.5 / n_levels, n_levels)
+    centroids = np.array(beta_dist.ppf(quantiles, alpha, alpha) * 2 - 1)
+
+    for _ in range(n_iters):
+        boundaries = (centroids[:-1] + centroids[1:]) / 2
+        new_centroids = np.zeros(n_levels)
+        for i in range(n_levels):
+            lo = -1.0 if i == 0 else boundaries[i - 1]
+            hi = 1.0 if i == n_levels - 1 else boundaries[i]
+            num, _ = integrate.quad(lambda x: x * pdf(x), lo, hi)
+            den, _ = integrate.quad(pdf, lo, hi)
+            new_centroids[i] = num / den if den > 1e-15 else centroids[i]
+        centroids = new_centroids
+
+    boundaries = (centroids[:-1] + centroids[1:]) / 2
+    return (
+        torch.tensor(boundaries, dtype=torch.float32),
+        torch.tensor(centroids, dtype=torch.float32),
+    )
+
+
+def _compute_mc_centroids(
+    d: int,
+    n_bits: int,
+    n_iters: int = 100,
+    n_samples: int = 200000,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Monte Carlo Lloyd-Max centroids for Beta((d-1)/2) on [-1, 1].
+
+    Fallback when scipy is unavailable. Uses 200K samples for centroid
+    estimation via vectorized scatter_add.
+    """
+    n_levels = 2**n_bits
+    alpha = (d - 1) / 2.0
+
+    beta_dist = torch.distributions.Beta(alpha, alpha)
+    samples = beta_dist.sample((n_samples,)).double() * 2 - 1
+
+    quantiles = torch.linspace(
+        0.5 / n_levels, 1.0 - 0.5 / n_levels, n_levels, dtype=torch.float64
+    )
+    sorted_samples, _ = samples.sort()
+    q_idx = (quantiles * n_samples).long().clamp(0, n_samples - 1)
+    centroids = sorted_samples[q_idx]
+
+    for _ in range(n_iters):
+        boundaries = (centroids[:-1] + centroids[1:]) / 2.0
+        assignments = torch.searchsorted(boundaries, samples)
+
+        sums = torch.zeros(n_levels, dtype=torch.float64)
+        counts = torch.zeros(n_levels, dtype=torch.float64)
+        sums.scatter_add_(0, assignments, samples)
+        counts.scatter_add_(0, assignments, torch.ones_like(samples))
+
+        nonempty = counts > 0
+        new_centroids = centroids.clone()
+        new_centroids[nonempty] = sums[nonempty] / counts[nonempty]
+        centroids = new_centroids
+
+    boundaries = (centroids[:-1] + centroids[1:]) / 2.0
+    return boundaries.float(), centroids.float()
+
+
 def compute_beta_centroids(
     d: int,
     n_bits: int,
@@ -71,48 +158,17 @@ def compute_beta_centroids(
     distribution is tightly concentrated near zero (std ~ 1/sqrt(d)), so
     centroid initialization must place all levels inside the data range.
 
-    Uses vectorized assignment via searchsorted (O(n log k) per iteration)
-    and scatter_add for mean computation, instead of O(n*k) distance matrix.
+    Uses exact numerical integration (scipy) when available, falling back
+    to Monte Carlo estimation with n_samples samples.
 
     Returns:
         boundaries: (2^n_bits - 1,) decision boundaries
         centroids: (2^n_bits,) reconstruction centroids
     """
-    n_levels = 2**n_bits
-    alpha = (d - 1) / 2.0
-
-    # Sample from Beta distribution mapped to [-1, 1]
-    beta_dist = torch.distributions.Beta(alpha, alpha)
-    samples = beta_dist.sample((n_samples,)).double() * 2 - 1
-
-    # Initialize centroids at distribution quantiles so every level
-    # starts inside the data range.
-    quantiles = torch.linspace(
-        0.5 / n_levels, 1.0 - 0.5 / n_levels, n_levels, dtype=torch.float64
-    )
-    sorted_samples, _ = samples.sort()
-    q_idx = (quantiles * n_samples).long().clamp(0, n_samples - 1)
-    centroids = sorted_samples[q_idx]
-
-    for _ in range(n_iters):
-        # Assign samples to nearest centroid via binary search on boundaries.
-        # boundaries[i] = midpoint between centroids[i] and centroids[i+1].
-        boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-        assignments = torch.searchsorted(boundaries, samples)
-
-        # Compute new centroids as mean of assigned samples (vectorized).
-        sums = torch.zeros(n_levels, dtype=torch.float64)
-        counts = torch.zeros(n_levels, dtype=torch.float64)
-        sums.scatter_add_(0, assignments, samples)
-        counts.scatter_add_(0, assignments, torch.ones_like(samples))
-
-        nonempty = counts > 0
-        new_centroids = centroids.clone()
-        new_centroids[nonempty] = sums[nonempty] / counts[nonempty]
-        centroids = new_centroids
-
-    boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-    return boundaries.float(), centroids.float()
+    try:
+        return _compute_exact_centroids(d, n_bits, n_iters)
+    except ImportError:
+        return _compute_mc_centroids(d, n_bits, n_iters, n_samples)
 
 
 def _hadamard_matrix(d: int) -> torch.Tensor:
@@ -790,15 +846,23 @@ def _turboquant_encode_packed_kernel(
     c_base = blk * stride_c_blk + off * stride_c_slot + head * stride_c_head
     tl.store(cache_ptr + c_base + offs_lo * stride_c_dim, packed)
 
-    # Scatter norm (float32 via strided view)
+    # Look up centroids for each half (needed for norm correction and QJL)
+    c_lo = tl.load(centroids_ptr + idx_lo.to(tl.int32))
+    c_hi = tl.load(centroids_ptr + idx_hi.to(tl.int32))
+
+    # Norm correction: centroid vector ||c[idx]|| != 1 after coordinate-wise
+    # quantization. Dividing by ||c[idx]|| ensures the reconstructed vector
+    # has the correct magnitude.
+    centroid_norm_sq = tl.sum(c_lo * c_lo, axis=0) + tl.sum(c_hi * c_hi, axis=0)
+    centroid_norm = tl.sqrt(centroid_norm_sq + 1e-12)
+    corrected_norm = norm / centroid_norm
+
+    # Scatter corrected norm (float32 via strided view)
     n_off = blk * stride_n_blk + off * stride_n_slot + head * stride_n_head
-    tl.store(norms_ptr + n_off, norm)
+    tl.store(norms_ptr + n_off, corrected_norm)
 
     # --- QJL: compute residual per half, pack signs, store res_scale ---
     if QJL_ENABLED:
-        # Look up centroids for each half
-        c_lo = tl.load(centroids_ptr + idx_lo.to(tl.int32))
-        c_hi = tl.load(centroids_ptr + idx_hi.to(tl.int32))
         r_lo = y_lo - c_lo
         r_hi = y_hi - c_hi
 
@@ -918,15 +982,24 @@ def _turboquant_encode_byte_kernel(
     c_base = blk * stride_c_blk + off * stride_c_slot + head * stride_c_head
     tl.store(cache_ptr + c_base + offs_d * stride_c_dim, idx)
 
-    # Scatter norm (float32 via strided view)
+    # Look up centroids for quantized indices (needed for norm correction
+    # and optionally for QJL residual computation)
+    centroid_vals = tl.load(centroids_ptr + idx.to(tl.int32))
+
+    # Norm correction: centroid vector ||c[idx]|| != 1 after coordinate-wise
+    # quantization. Dividing by ||c[idx]|| ensures the reconstructed vector
+    # K = c[idx] * corrected_norm has ||K|| == original ||K||.
+    centroid_norm_sq = tl.sum(centroid_vals * centroid_vals, axis=0)
+    centroid_norm = tl.sqrt(centroid_norm_sq + 1e-12)
+    corrected_norm = norm / centroid_norm
+
+    # Scatter corrected norm (float32 via strided view)
     n_off = blk * stride_n_blk + off * stride_n_slot + head * stride_n_head
-    tl.store(norms_ptr + n_off, norm)
+    tl.store(norms_ptr + n_off, corrected_norm)
 
     # --- QJL: compute residual, pack signs, store res_scale ---
     if QJL_ENABLED:
-        # Look up centroids for quantized indices
-        centroid_vals = tl.load(centroids_ptr + idx.to(tl.int32))
-        # Residual: y - centroid
+        # Residual: y - centroid (reusing centroid_vals from above)
         residual = y - centroid_vals
 
         # res_scale = mean(|residual|) = sum(|r|) / d
@@ -1555,69 +1628,6 @@ def turboquant_dequant_paged(
 
 
 @triton.jit
-def _turboquant_encode_signflip_kernel(
-    key_ptr,
-    value_ptr,
-    input_stride_token: tl.int64,
-    input_stride_head: tl.int64,
-    key_cache_ptr,
-    value_cache_ptr,
-    cache_stride_block: tl.int64,
-    cache_stride_slot: tl.int64,
-    cache_stride_head: tl.int64,
-    k_norms_ptr,
-    v_norms_ptr,
-    norms_stride_block: tl.int64,
-    norms_stride_slot: tl.int64,
-    norms_stride_head: tl.int64,
-    slot_mapping_ptr,
-    boundaries_ptr,
-    rotation_signs_ptr,
-    N_LEVELS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-):
-    """Triton encode kernel with sign-flip rotation (fast but less accurate)."""
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    slot = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
-    if slot < 0:
-        return
-    block_idx = slot // BLOCK_SIZE
-    block_offset = slot % BLOCK_SIZE
-    offs = tl.arange(0, HEAD_DIM)
-    src_offset = token_idx * input_stride_token + head_idx * input_stride_head
-    cache_offset = (
-        block_idx * cache_stride_block
-        + block_offset * cache_stride_slot
-        + head_idx * cache_stride_head
-    )
-    norms_offset = (
-        block_idx * norms_stride_block
-        + block_offset * norms_stride_slot
-        + head_idx * norms_stride_head
-    )
-    signs = tl.load(rotation_signs_ptr + offs)
-    k = tl.load(key_ptr + src_offset + offs).to(tl.float32)
-    k_norm = tl.sqrt(tl.sum(k * k, axis=0) + 1e-12)
-    k_rot = k / (k_norm + 1e-8) * signs
-    k_idx = tl.zeros([HEAD_DIM], dtype=tl.uint8)
-    for i in range(N_LEVELS - 1):
-        b = tl.load(boundaries_ptr + i)
-        k_idx += (k_rot > b).to(tl.uint8)
-    tl.store(key_cache_ptr + cache_offset + offs, k_idx)
-    tl.store(k_norms_ptr + norms_offset, k_norm)
-    v = tl.load(value_ptr + src_offset + offs).to(tl.float32)
-    v_norm = tl.sqrt(tl.sum(v * v, axis=0) + 1e-12)
-    v_rot = v / (v_norm + 1e-8) * signs
-    v_idx = tl.zeros([HEAD_DIM], dtype=tl.uint8)
-    for i in range(N_LEVELS - 1):
-        b = tl.load(boundaries_ptr + i)
-        v_idx += (v_rot > b).to(tl.uint8)
-    tl.store(value_cache_ptr + cache_offset + offs, v_idx)
-    tl.store(v_norms_ptr + norms_offset, v_norm)
-
-
 # ============================================================================
 # Python Reference (for testing)
 # ============================================================================
@@ -1648,12 +1658,19 @@ def turboquant_encode_ref(
     for i in range(codebook.n_levels - 1):
         indices += (y > codebook.boundaries[i].to(tensor.device)).to(torch.uint8)
 
+    # Norm correction: centroid vector is NOT unit norm after coordinate-wise
+    # quantization. Correcting ensures ||K_recon|| == original ||K||.
+    centroids = codebook.centroids.to(tensor.device)
+    centroid_vals = centroids[indices.long()]  # (..., head_dim)
+    centroid_norms = torch.norm(centroid_vals.float(), dim=-1)  # (...,)
+    corrected_norms = norms / (centroid_norms + 1e-12)
+
     if packed and not codebook.byte_mode:
         indices = pack_nibbles(indices)
 
     if squeeze:
-        return indices.squeeze(1), norms.squeeze(1)
-    return indices, norms
+        return indices.squeeze(1), corrected_norms.squeeze(1)
+    return indices, corrected_norms
 
 
 def turboquant_decode_ref(
@@ -1776,6 +1793,11 @@ def turboquant_encode_qjl_ref(
     centroid_vals = centroids[indices.long()]
     residual = y - centroid_vals
 
+    # Norm correction: centroid vector is NOT unit norm after coordinate-wise
+    # quantization. Correcting ensures ||K_recon|| == original ||K||.
+    centroid_norms = torch.norm(centroid_vals.float(), dim=-1)
+    corrected_norms = norms / (centroid_norms + 1e-12)
+
     # sign(r) and mean(|r|)
     sign_raw = residual >= 0
     sign_bits = pack_sign_bits(sign_raw)
@@ -1784,11 +1806,11 @@ def turboquant_encode_qjl_ref(
     if squeeze:
         return (
             indices.squeeze(1),
-            norms.squeeze(1),
+            corrected_norms.squeeze(1),
             sign_bits.squeeze(1),
             res_scales.squeeze(1),
         )
-    return indices, norms, sign_bits, res_scales
+    return indices, corrected_norms, sign_bits, res_scales
 
 
 def turboquant_decode_qjl_ref(
@@ -2057,7 +2079,3 @@ def turboquant_dequant_single(
             SIGN_BYTES_HALF=(hd // 2 + 7) // 8 if qjl else 1,
             DIRTY_CHECK=dirty_check,
         )
-
-
-# Keep old name for backward compat
-generate_rotation_signs = None  # removed, use generate_rotation_matrix

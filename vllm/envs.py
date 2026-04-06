@@ -83,8 +83,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TURBOQUANT_BITS: int = 0
-    VLLM_TURBOQUANT_QJL: bool = True
-    VLLM_TURBOQUANT_DEQUANT_FIRST: bool = True
+    VLLM_TURBOQUANT_QJL: bool = False
     VLLM_TURBOQUANT_OUTLIER_BITS: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -514,12 +513,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
     # Number of bits for TurboQuant KV cache compression (3-8, 0=auto).
     "VLLM_TURBOQUANT_BITS": lambda: int(os.getenv("VLLM_TURBOQUANT_BITS", "0")),
-    # Enable QJL sign-correction for TurboQuant byte mode (default: enabled).
-    "VLLM_TURBOQUANT_QJL": lambda: bool(int(os.getenv("VLLM_TURBOQUANT_QJL", "1"))),
-    # Dequant-first: decompress TQ blocks to bf16 before attention.
-    "VLLM_TURBOQUANT_DEQUANT_FIRST":
-        lambda: bool(int(os.getenv(
-            "VLLM_TURBOQUANT_DEQUANT_FIRST", "1"))),
+    # Enable QJL sign-correction for TurboQuant (default: disabled).
+    # The paper uses Algorithm 1 (MSE-only) for KV cache. QJL adds
+    # variance that softmax amplifies, hurting quality.
+    "VLLM_TURBOQUANT_QJL": lambda: bool(int(os.getenv("VLLM_TURBOQUANT_QJL", "0"))),
     # Outlier channel bits: "outlier_bits,regular_bits" e.g. "4,2"
     # for 2.5-bit avg. Empty string = disabled (uniform bits).
     "VLLM_TURBOQUANT_OUTLIER_BITS":

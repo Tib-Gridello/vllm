@@ -9,15 +9,18 @@ compression levels."
 Preset format: tq-k{K}v{V}[-qjl][-o]
   K = key bits (2-8)
   V = value bits (2-8)
-  qjl = sign correction enabled
+  qjl = sign correction enabled (opt-in, not recommended for attention)
   o = outlier channel mode (mixed-precision: outlier@K bits, regular@2 bits)
 
-Examples:
-  tq-k8v8      = 8-bit keys + 8-bit values (quality baseline, 2x compression)
-  tq-k8v8-qjl  = 8-bit with sign correction (best quality)
-  tq-k4v4      = 4-bit keys + 4-bit values (4x compression)
-  tq-k4v4-qjl  = 4-bit with sign correction
+Recommended presets:
+  tq-k8v8      = 8-bit MSE-only (best quality, 2x compression, default)
+  tq-k4v4      = 4-bit MSE-only (4x compression)
   tq-k4v2o     = outlier mode: 4-bit outlier channels + 2-bit regular (paper)
+
+QJL (-qjl suffix) adds 1-bit residual sign correction. The paper uses
+Algorithm 1 (MSE-only) for KV cache, not Algorithm 2 (QJL). Community
+consensus: QJL adds variance that softmax amplifies, hurting quality.
+Use MSE-only with norm correction (enabled by default) instead.
 """
 
 from __future__ import annotations
@@ -99,9 +102,10 @@ class TQPreset:
 _TQ_PATTERN = re.compile(r"^tq-k(\d+)v(\d+)(-qjl)?(o|-o)?$")
 
 
-# Backward compat: old "turboquant" string maps to best-quality preset
+# Backward compat: old "turboquant" string maps to best-quality preset.
+# Uses MSE-only (no QJL) — the paper's Algorithm 1 for KV cache.
 _TQ_ALIASES = {
-    "turboquant": "tq-k8v8-qjl",
+    "turboquant": "tq-k8v8",
 }
 
 

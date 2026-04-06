@@ -2,22 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Standalone TurboQuant KV Cache Compression Backend.
 
-Implements PolarQuant from "TurboQuant: Online Vector Quantization with
-Near-optimal Distortion Rate" (arXiv:2504.19874).
+Implements Algorithm 1 (MSE-only) from "TurboQuant: Online Vector
+Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874).
 
 Architecture: fused attention — the Triton unified attention kernel reads
-compressed indices inline, looks up centroids, applies norms and QJL sign
-correction, and computes attention in a single pass. No staging buffer.
+compressed indices inline, looks up centroids, applies norm-corrected
+L2 norms, and computes attention in a single pass. No staging buffer.
 
-Unique features over other TQ implementations:
+Key design choices:
 - Hadamard rotation (3pp MMLU improvement over random QR)
-- Sign correction (QJL variant, 1-bit residual per coordinate)
+- Norm correction (compensates centroid vector norm != 1)
+- Exact Lloyd-Max codebook (scipy numerical integration, not Monte Carlo)
+- MSE-only by default (paper's Algorithm 1 for KV cache; QJL opt-in)
 - Fused decode (no decompression to bf16 staging)
-- Named presets via --kv-cache-dtype (e.g. tq-k8v8-qjl)
+- Named presets via --kv-cache-dtype
 
 Usage:
-  vllm serve <model> --kv-cache-dtype tq-k8v8-qjl
-  vllm serve <model> --kv-cache-dtype tq-k4v4
+  vllm serve <model> --kv-cache-dtype tq-k8v8      # 8-bit, 2x compression
+  vllm serve <model> --kv-cache-dtype tq-k4v4      # 4-bit, 4x compression
+  vllm serve <model> --kv-cache-dtype tq-k8v8-qjl  # with sign correction (opt-in)
 """
 
 from __future__ import annotations
