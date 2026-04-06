@@ -260,11 +260,15 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         if self._outlier_mode:
             # Outlier mode: dequant-first architecture.
             # Compressed cache → Triton dequant → bf16 staging → standard attention.
+            # Configs are created with default mask initially; calibration
+            # replaces the mask on the first forward pass using actual K/V
+            # channel variances.
             from vllm.v1.attention.ops.turboquant import OutlierChannelConfig
 
             self._kv_quant_mode = KVQuantMode.NONE  # staging is bf16
+            self._needs_calibration = True
 
-            # k_bits = outlier bits, v_bits = regular bits (preset convention)
+            # Default configs (will be replaced by calibrated ones)
             self._k_outlier_config = OutlierChannelConfig(
                 head_dim=head_size,
                 outlier_ratio=self._preset.outlier_ratio,
@@ -285,7 +289,8 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             logger.info(
                 "TurboQuant backend: preset=%s, outlier_bits=%d, "
                 "regular_bits=%d, outlier_ratio=%.2f, avg_bits=%.1f, "
-                "head_dim=%d, padded_dim=%d, mode=dequant-first",
+                "head_dim=%d, padded_dim=%d, mode=dequant-first"
+                " (calibration pending)",
                 self._preset.name,
                 self._preset.k_bits,
                 self._preset.v_bits,
@@ -696,6 +701,68 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         return output
 
+    # ----- Outlier Calibration -----
+
+    def _calibrate_outlier_channels(
+        self, key: torch.Tensor, value: torch.Tensor,
+    ) -> None:
+        """Calibrate outlier channel selection from actual K/V data.
+
+        Computes per-channel variance across the batch and selects the
+        top outlier_ratio fraction as outlier channels. Recreates the
+        OutlierChannelConfig with the calibrated mask.
+
+        This runs ONCE on the first forward pass, then the mask is frozen.
+        """
+        from vllm.v1.attention.ops.turboquant import OutlierChannelConfig
+
+        # key/value: (num_tokens, num_kv_heads, head_dim)
+        # Compute per-channel variance across tokens and heads
+        k_float = key.float()
+        v_float = value.float()
+        # Combine K and V variance for a unified mask
+        kv_cat = torch.cat([k_float, v_float], dim=0)  # (2T, H, D)
+        channel_var = kv_cat.var(dim=(0, 1))  # (D,)
+
+        outlier_dim = int(self.head_size * self._preset.outlier_ratio)
+        # Select top-k channels by variance
+        _, top_indices = channel_var.topk(outlier_dim)
+        outlier_mask = torch.zeros(
+            self.head_size, dtype=torch.bool, device=key.device,
+        )
+        outlier_mask[top_indices] = True
+
+        logger.info(
+            "TurboQuant outlier calibration: top-%d channels by variance "
+            "(var range: [%.4f, %.4f], outlier mean var: %.4f, "
+            "regular mean var: %.4f)",
+            outlier_dim,
+            channel_var.min().item(),
+            channel_var.max().item(),
+            channel_var[outlier_mask].mean().item(),
+            channel_var[~outlier_mask].mean().item(),
+        )
+
+        # Recreate configs with calibrated mask
+        self._k_outlier_config = OutlierChannelConfig(
+            head_dim=self.head_size,
+            outlier_ratio=self._preset.outlier_ratio,
+            outlier_bits=self._preset.k_bits,
+            regular_bits=self._preset.v_bits,
+            seed=42,
+            device=key.device.type,
+            outlier_mask=outlier_mask.cpu(),
+        )
+        self._v_outlier_config = OutlierChannelConfig(
+            head_dim=self.head_size,
+            outlier_ratio=self._preset.outlier_ratio,
+            outlier_bits=self._preset.k_bits,
+            regular_bits=self._preset.v_bits,
+            seed=43,
+            device=key.device.type,
+            outlier_mask=outlier_mask.cpu(),
+        )
+
     # ----- KV Cache Update -----
 
     def do_kv_cache_update(
@@ -710,6 +777,10 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._norms_dirty = False
             self._reset_cache_views()
         self._ensure_cache_views(kv_cache)
+
+        if self._outlier_mode and self._needs_calibration:
+            self._calibrate_outlier_channels(key, value)
+            self._needs_calibration = False
 
         key_cache, value_cache = kv_cache.unbind(1)
         dev = key.device
