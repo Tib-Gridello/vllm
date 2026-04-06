@@ -512,31 +512,42 @@ def outlier_encode_ref(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference encode with outlier channel splitting.
 
+    Each subgroup (outlier, regular) is quantized independently with its
+    own L2 norm, rotation matrix, and codebook. Per-subgroup norms are
+    critical: subsets of a unit vector in R^d are NOT unit vectors in
+    their subspaces.
+
     Args:
         tensor: (..., head_dim) input tensor
 
     Returns:
-        outlier_indices, regular_indices, norms, channel_data
-        where channel_data packs outlier + regular indices contiguously.
+        outlier_indices: (..., outlier_dim) uint8
+        regular_indices: (..., regular_dim) uint8
+        outlier_norms: (...) float32 — L2 norms of outlier subgroup
+        regular_norms: (...) float32 — L2 norms of regular subgroup
     """
     device = tensor.device
     config_dev = config.to(device)
 
-    # Compute shared L2 norm (from full vector)
-    norms = tensor.float().norm(dim=-1)
+    # Split channels BEFORE normalization
+    x_out = tensor.float()[..., config_dev.outlier_idx]  # (..., outlier_dim)
+    x_reg = tensor.float()[..., config_dev.regular_idx]  # (..., regular_dim)
 
-    # Normalize full vector, then split
-    t_hat = tensor.float() / (norms.unsqueeze(-1) + 1e-10)
-    t_out_hat = t_hat[..., config_dev.outlier_idx]
-    t_reg_hat = t_hat[..., config_dev.regular_idx]
+    # Per-subgroup L2 norms (NOT shared!)
+    norm_out = x_out.norm(dim=-1)  # (...)
+    norm_reg = x_reg.norm(dim=-1)  # (...)
+
+    # Normalize each subgroup to unit sphere in its own subspace
+    x_out_hat = x_out / (norm_out.unsqueeze(-1) + 1e-10)
+    x_reg_hat = x_reg / (norm_reg.unsqueeze(-1) + 1e-10)
 
     # Rotate each group independently
     R_out_T = config_dev.outlier_cb.rotation_matrix_T
     R_reg_T = config_dev.regular_cb.rotation_matrix_T
-    shape_out = t_out_hat.shape
-    shape_reg = t_reg_hat.shape
-    y_out = (t_out_hat.reshape(-1, shape_out[-1]) @ R_out_T).reshape(shape_out)
-    y_reg = (t_reg_hat.reshape(-1, shape_reg[-1]) @ R_reg_T).reshape(shape_reg)
+    shape_out = x_out_hat.shape
+    shape_reg = x_reg_hat.shape
+    y_out = (x_out_hat.reshape(-1, shape_out[-1]) @ R_out_T).reshape(shape_out)
+    y_reg = (x_reg_hat.reshape(-1, shape_reg[-1]) @ R_reg_T).reshape(shape_reg)
 
     # Quantize each group
     out_cb = config_dev.outlier_cb
@@ -550,19 +561,30 @@ def outlier_encode_ref(
     for i in range(reg_cb.n_levels - 1):
         reg_idx += (y_reg > reg_cb.boundaries[i]).to(torch.uint8)
 
-    return out_idx, reg_idx, norms
+    # Norm correction per subgroup
+    out_centroid_vals = out_cb.centroids[out_idx.long()]
+    out_cnorm = torch.norm(out_centroid_vals.float(), dim=-1)
+    norm_out_corrected = norm_out / (out_cnorm + 1e-12)
+
+    reg_centroid_vals = reg_cb.centroids[reg_idx.long()]
+    reg_cnorm = torch.norm(reg_centroid_vals.float(), dim=-1)
+    norm_reg_corrected = norm_reg / (reg_cnorm + 1e-12)
+
+    return out_idx, reg_idx, norm_out_corrected, norm_reg_corrected
 
 
 def outlier_decode_ref(
     outlier_indices: torch.Tensor,
     regular_indices: torch.Tensor,
-    norms: torch.Tensor,
+    outlier_norms: torch.Tensor,
+    regular_norms: torch.Tensor,
     config: OutlierChannelConfig,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Reference decode with outlier channel reconstruction.
 
-    Reconstructs in ORIGINAL space (applies inverse rotation per group).
+    Reconstructs in ORIGINAL space (applies inverse rotation per group,
+    scales by per-subgroup norms, scatters to original positions).
     """
     device = outlier_indices.device
     config_dev = config.to(device)
@@ -579,13 +601,13 @@ def outlier_decode_ref(
     x_out = (out_vals.float().reshape(-1, shape_out[-1]) @ R_out).reshape(shape_out)
     x_reg = (reg_vals.float().reshape(-1, shape_reg[-1]) @ R_reg).reshape(shape_reg)
 
-    # Scale by norm
-    x_out = norms.unsqueeze(-1) * x_out
-    x_reg = norms.unsqueeze(-1) * x_reg
+    # Scale by per-subgroup norms (NOT shared)
+    x_out = outlier_norms.unsqueeze(-1) * x_out
+    x_reg = regular_norms.unsqueeze(-1) * x_reg
 
     # Scatter back to original positions
     head_dim = config_dev.head_dim
-    output_shape = (*norms.shape, head_dim)
+    output_shape = (*outlier_norms.shape, head_dim)
     output = torch.zeros(output_shape, dtype=torch.float32, device=device)
     output[..., config_dev.outlier_idx] = x_out
     output[..., config_dev.regular_idx] = x_reg
@@ -598,18 +620,25 @@ def outlier_reshape_and_cache(
     value: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    k_norms: torch.Tensor,
-    v_norms: torch.Tensor,
+    k_out_norms: torch.Tensor,
+    k_reg_norms: torch.Tensor,
+    v_out_norms: torch.Tensor,
+    v_reg_norms: torch.Tensor,
     slot_mapping: torch.Tensor,
     config: OutlierChannelConfig,
 ) -> None:
     """Encode K/V with outlier channel splitting into paged cache.
 
+    Each subgroup (outlier, regular) is independently normalized, rotated,
+    and quantized with its own codebook and per-subgroup L2 norm.
+
     Storage layout per token-head:
-    [outlier_packed | regular_packed | norm(4B)]
+    [outlier_packed | regular_packed]
+    Norms stored separately in strided float32 views.
 
     For 4-bit outlier + 2-bit regular with d=128:
-    [16B nibble | 24B 2bit-packed | 4B norm] = 44 bytes
+    [16B nibble | 24B 2bit-packed] = 40 bytes indices
+    + 4B outlier_norm + 4B regular_norm = 48 bytes total
     """
     valid = slot_mapping >= 0
     valid_slots = slot_mapping[valid]
@@ -617,42 +646,56 @@ def outlier_reshape_and_cache(
     config_dev = config.to(dev)
     block_size = key_cache.shape[1]
 
-    for src, cache, norms_out in [
-        (key, key_cache, k_norms),
-        (value, value_cache, v_norms),
+    for src, cache, out_norms, reg_norms in [
+        (key, key_cache, k_out_norms, k_reg_norms),
+        (value, value_cache, v_out_norms, v_reg_norms),
     ]:
         x = src[valid].float()  # (n_valid, nkv, head_dim)
 
-        # Shared L2 norm
-        nrm = x.norm(dim=-1)  # (n_valid, nkv)
+        # Split channels BEFORE normalization
+        x_out = x[..., config_dev.outlier_idx]
+        x_reg = x[..., config_dev.regular_idx]
 
-        # Normalize
-        x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
+        # Per-subgroup L2 norms
+        nrm_out = x_out.norm(dim=-1)  # (n_valid, nkv)
+        nrm_reg = x_reg.norm(dim=-1)
 
-        # Split channels
-        x_out = x_hat[..., config_dev.outlier_idx]
-        x_reg = x_hat[..., config_dev.regular_idx]
+        # Normalize each subgroup independently
+        x_out_hat = x_out / (nrm_out.unsqueeze(-1) + 1e-10)
+        x_reg_hat = x_reg / (nrm_reg.unsqueeze(-1) + 1e-10)
 
         # Rotate each group
         R_out_T = config_dev.outlier_cb.rotation_matrix_T
         R_reg_T = config_dev.regular_cb.rotation_matrix_T
-        s_out = x_out.shape
-        s_reg = x_reg.shape
-        y_out = (x_out.reshape(-1, s_out[-1]) @ R_out_T).reshape(s_out)
-        y_reg = (x_reg.reshape(-1, s_reg[-1]) @ R_reg_T).reshape(s_reg)
+        s_out = x_out_hat.shape
+        s_reg = x_reg_hat.shape
+        y_out = (x_out_hat.reshape(-1, s_out[-1]) @ R_out_T).reshape(s_out)
+        y_reg = (x_reg_hat.reshape(-1, s_reg[-1]) @ R_reg_T).reshape(s_reg)
 
-        # Quantize outlier (4-bit nibble)
+        # Quantize outlier
         out_cb = config_dev.outlier_cb
         out_idx = torch.zeros_like(y_out, dtype=torch.uint8)
         for i in range(out_cb.n_levels - 1):
             out_idx += (y_out > out_cb.boundaries[i]).to(torch.uint8)
-        out_packed = pack_nibbles(out_idx)  # (..., outlier_dim//2)
 
-        # Quantize regular (2-bit)
+        # Norm correction for outlier
+        out_centroid_vals = out_cb.centroids[out_idx.long()]
+        out_cnorm = torch.norm(out_centroid_vals.float(), dim=-1)
+        nrm_out_corrected = nrm_out / (out_cnorm + 1e-12)
+
+        # Quantize regular
         reg_cb = config_dev.regular_cb
         reg_idx = torch.zeros_like(y_reg, dtype=torch.uint8)
         for i in range(reg_cb.n_levels - 1):
             reg_idx += (y_reg > reg_cb.boundaries[i]).to(torch.uint8)
+
+        # Norm correction for regular
+        reg_centroid_vals = reg_cb.centroids[reg_idx.long()]
+        reg_cnorm = torch.norm(reg_centroid_vals.float(), dim=-1)
+        nrm_reg_corrected = nrm_reg / (reg_cnorm + 1e-12)
+
+        # Pack indices
+        out_packed = pack_nibbles(out_idx)  # (..., outlier_dim//2)
         reg_packed = pack_2bit(reg_idx)  # (..., regular_dim//4)
 
         # Scatter to paged cache
@@ -666,14 +709,12 @@ def outlier_reshape_and_cache(
             blk = slot // block_size
             off = slot % block_size
             for h in range(nkv):
-                # Write outlier packed indices
                 cache[blk, off, h, :out_bytes] = out_packed[tok_i, h]
-                # Write regular packed indices after outlier
-                cache[blk, off, h, out_bytes : out_bytes + reg_bytes] = reg_packed[
-                    tok_i, h
-                ]
-                # Write norm
-                norms_out[blk, off, h] = nrm[tok_i, h]
+                cache[blk, off, h, out_bytes:out_bytes + reg_bytes] = (
+                    reg_packed[tok_i, h]
+                )
+                out_norms[blk, off, h] = nrm_out_corrected[tok_i, h]
+                reg_norms[blk, off, h] = nrm_reg_corrected[tok_i, h]
 
 
 def outlier_dequant_paged(
