@@ -545,9 +545,6 @@ def outlier_reshape_and_cache(
     [16B nibble | 24B 2bit-packed | 4B norm] = 44 bytes
     """
     valid = slot_mapping >= 0
-    if not valid.any():
-        return
-
     valid_slots = slot_mapping[valid]
     dev = key.device
     config_dev = config.to(dev)
@@ -1854,9 +1851,8 @@ def turboquant_encode_single(
         return
 
     valid = slot_mapping >= 0
-    if not valid.any():
-        return
-
+    # Don't call valid.any() — it syncs GPU→CPU, breaking CUDAGraph.
+    # The Triton kernel handles invalid slots (slot < 0 → early return).
     valid_slots = slot_mapping[valid]
     qjl = codebook.qjl
     R_T = codebook.rotation_matrix_T

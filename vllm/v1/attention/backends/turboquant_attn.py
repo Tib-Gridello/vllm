@@ -204,7 +204,6 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _v_res_scales: torch.Tensor | None = None
     _staging_key: torch.Tensor | None = None
     _staging_val: torch.Tensor | None = None
-    _max_blocks_per_seq: int = 0
     _norms_dirty: bool = False
 
     def __init__(
@@ -355,68 +354,37 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     def _ensure_staging(
         self,
         kv_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        seq_lens: torch.Tensor,
+        slot_mapping: torch.Tensor | None = None,
     ) -> None:
-        """Allocate bf16 staging buffers for dequant-first path.
+        """Pre-allocate bf16 staging buffers for dequant-first path.
 
-        CUDAGraph safe: buffers grow monotonically and are never
-        reallocated inside a captured graph. After the warmup phase
-        allocates for the largest capture batch, all subsequent forward()
-        calls (captured or replayed) take the early-return path.
+        Allocates to total num_blocks capacity (the maximum we could
+        ever need). Called from do_kv_cache_update (OUTSIDE CUDAGraph)
+        so forward() never allocates during graph capture/replay.
         """
-        num_seqs = block_table.shape[0]
+        num_blocks = kv_cache.shape[0]
         block_size = kv_cache.shape[2]
         nkv = kv_cache.shape[3]
 
-        max_seq = int(seq_lens.max().item()) if num_seqs > 0 else 0
-        max_bps = (max_seq + block_size - 1) // block_size
-        if max_bps < 1:
-            max_bps = 1
-        needed = num_seqs * max_bps
-
-        if (
-            self._staging_key is not None
-            and self._staging_key.shape[0] >= needed
-            and self._max_blocks_per_seq >= max_bps
-        ):
+        if self._staging_key is not None and self._staging_key.shape[0] >= num_blocks:
             return
 
         head_dim = self.head_size
         device = kv_cache.device
 
-        self._max_blocks_per_seq = max_bps
         self._staging_key = torch.zeros(
-            (needed, block_size, nkv, head_dim),
+            (num_blocks, block_size, nkv, head_dim),
             dtype=torch.bfloat16,
             device=device,
         )
         self._staging_val = torch.zeros(
-            (needed, block_size, nkv, head_dim),
+            (num_blocks, block_size, nkv, head_dim),
             dtype=torch.bfloat16,
             device=device,
         )
 
-    def _build_staging_block_table(
-        self,
-        block_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build staging block table from batch geometry.
-
-        This is a lightweight index computation (no allocation) that maps
-        (seq, block_pos) → staging buffer offset. Safe inside CUDAGraph
-        because the output tensor size is bounded by the pre-allocated
-        staging buffer.
-        """
-        num_seqs = block_table.shape[0]
-        max_bps = self._max_blocks_per_seq
-        return torch.arange(
-            0,
-            num_seqs * max_bps,
-            dtype=block_table.dtype,
-            device=block_table.device,
-        ).reshape(num_seqs, max_bps)
+    # No staging block table needed: staging is indexed by physical block
+    # number (same as kv_cache), so attention uses the original block_table.
 
     # ----- Forward -----
 
@@ -454,11 +422,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             turboquant_dequant_single,
         )
 
-        self._ensure_staging(
-            kv_cache,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-        )
+        # NOTE: _ensure_staging is called in do_kv_cache_update (before
+        # CUDAGraph capture). By the time forward() is captured/replayed,
+        # staging buffers already exist and are large enough.
 
         dev = kv_cache.device
         key_cache, value_cache = kv_cache.unbind(1)
@@ -468,6 +434,8 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         assert self._staging_key is not None
         assert self._staging_val is not None
 
+        max_blocks_per_seq = attn_metadata.block_table.shape[1]
+
         k_cb = self._k_codebook.to(dev)
         turboquant_dequant_single(
             key_cache,
@@ -476,7 +444,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             k_cb,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
-            self._max_blocks_per_seq,
+            max_blocks_per_seq,
             signs=self._k_signs if k_cb.qjl else None,
             res_scales=self._k_res_scales if k_cb.qjl else None,
         )
@@ -489,7 +457,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             v_cb,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
-            self._max_blocks_per_seq,
+            max_blocks_per_seq,
             signs=self._v_signs if v_cb.qjl else None,
             res_scales=self._v_res_scales if v_cb.qjl else None,
         )
@@ -498,13 +466,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         k_R_T = k_cb.rotation_matrix_T
         q_rot = rotate_query(query[:num_actual_tokens], k_R_T)
 
-        # Build staging block table (lightweight index math, no allocation)
-        staging_bt = self._build_staging_block_table(
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-        )
-
-        # Standard Triton unified attention on decompressed bf16 data
+        # Standard Triton unified attention on decompressed bf16 staging.
+        # Staging is indexed by physical block (same as kv_cache), so we
+        # pass the original block_table directly.
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
         )
@@ -523,7 +487,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             alibi_slopes=self.alibi_slopes,
             use_alibi_sqrt=self.use_alibi_sqrt,
             window_size=self.sliding_window,
-            block_table=staging_bt,
+            block_table=attn_metadata.block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,
             k_descale=None,
@@ -552,6 +516,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._norms_dirty = False
             self._reset_cache_views()
         self._ensure_cache_views(kv_cache)
+        # Pre-allocate staging here (runs OUTSIDE CUDAGraph capture).
+        # forward() then reuses these buffers without allocation.
+        self._ensure_staging(kv_cache)
 
         from vllm.v1.attention.ops.turboquant import turboquant_encode_single
 
