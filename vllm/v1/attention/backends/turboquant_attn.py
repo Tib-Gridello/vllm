@@ -467,22 +467,30 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             reg_norms.fill_(0.0)
             setattr(self, f"{attr_prefix}_reg_norms", reg_norms)
 
-    def _ensure_staging_buffers(self, kv_cache: torch.Tensor) -> None:
-        """Allocate staging buffers for outlier dequant-first mode."""
-        if self._staging_k is not None:
-            return
+    def _ensure_staging_buffers(
+        self, kv_cache: torch.Tensor, n_staging_blocks: int,
+    ) -> None:
+        """Allocate/resize staging buffers for outlier dequant-first mode.
 
-        num_blocks, _, block_size, nkv, _ = kv_cache.shape
+        Only allocates for `n_staging_blocks` (= num_seqs * max_blocks_per_seq),
+        NOT the full cache capacity. This keeps memory usage proportional to the
+        active batch, preserving the compression memory savings.
+        """
+        _, _, block_size, nkv, _ = kv_cache.shape
         head_dim = self.head_size
         device = kv_cache.device
 
+        # Only reallocate if current buffers are too small
+        if self._staging_k is not None and self._staging_k.shape[0] >= n_staging_blocks:
+            return
+
         # Staging: bf16 paged cache for decompressed data
         self._staging_k = torch.zeros(
-            (num_blocks, block_size, nkv, head_dim),
+            (n_staging_blocks, block_size, nkv, head_dim),
             dtype=torch.bfloat16, device=device,
         )
         self._staging_v = torch.zeros(
-            (num_blocks, block_size, nkv, head_dim),
+            (n_staging_blocks, block_size, nkv, head_dim),
             dtype=torch.bfloat16, device=device,
         )
 
@@ -490,11 +498,11 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         outlier_dim = self._k_outlier_config.outlier_dim
         regular_dim = self._k_outlier_config.regular_dim
         self._out_rotated_buf = torch.zeros(
-            (num_blocks, block_size, nkv, outlier_dim),
+            (n_staging_blocks, block_size, nkv, outlier_dim),
             dtype=torch.float32, device=device,
         )
         self._reg_rotated_buf = torch.zeros(
-            (num_blocks, block_size, nkv, regular_dim),
+            (n_staging_blocks, block_size, nkv, regular_dim),
             dtype=torch.float32, device=device,
         )
 
@@ -616,16 +624,30 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         No Q rotation or output inverse-rotation needed — the staging
         buffer contains data in the original (unrotated) space.
+
+        Uses compacted staging: dequant writes sequentially to
+        staging[seq_idx * max_blocks + block_pos], and unified_attention
+        uses a sequential block_table to match.
         """
         from vllm.v1.attention.ops.turboquant import outlier_dequant_to_staging
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
         )
 
-        self._ensure_staging_buffers(kv_cache)
         dev = kv_cache.device
-        key_cache, value_cache = kv_cache.unbind(1)
+        num_seqs = attn_metadata.block_table.shape[0]
         max_blocks_per_seq = attn_metadata.block_table.shape[1]
+        n_staging_blocks = num_seqs * max_blocks_per_seq
+
+        self._ensure_staging_buffers(kv_cache, n_staging_blocks)
+        key_cache, value_cache = kv_cache.unbind(1)
+
+        # Sequential block table for staging: staging_bt[s, b] = s * max_blocks + b
+        # The dequant kernel writes to staging_blk = seq_idx * max_blocks + block_pos,
+        # so this mapping lets unified_attention find the right staging blocks.
+        staging_bt = torch.arange(
+            n_staging_blocks, device=dev, dtype=attn_metadata.block_table.dtype,
+        ).reshape(num_seqs, max_blocks_per_seq)
 
         # Dequant K to staging (original space)
         k_cfg = self._k_outlier_config.to(dev)
@@ -649,7 +671,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             reg_rotated_buf=self._reg_rotated_buf,
         )
 
-        # Standard attention on bf16 staging — no rotation needed
+        # Standard attention on bf16 staging with sequential block table
         unified_attention(
             q=query[:num_actual_tokens],
             k=self._staging_k,
@@ -664,7 +686,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             alibi_slopes=self.alibi_slopes,
             use_alibi_sqrt=self.use_alibi_sqrt,
             window_size=self.sliding_window,
-            block_table=attn_metadata.block_table,
+            block_table=staging_bt,
             softcap=self.logits_soft_cap,
             q_descale=None,
             k_descale=None,
