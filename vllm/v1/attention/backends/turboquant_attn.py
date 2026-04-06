@@ -222,6 +222,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _staging_v: torch.Tensor | None = None
     _out_rotated_buf: torch.Tensor | None = None
     _reg_rotated_buf: torch.Tensor | None = None
+    _staging_block_table: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -560,7 +561,6 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         from vllm.v1.attention.ops.turboquant import (
             inverse_rotate_output,
             rotate_query,
-            sign_bytes_padded,
         )
 
         dev = kv_cache.device
@@ -634,10 +634,10 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         staging[seq_idx * max_blocks + block_pos], and unified_attention
         uses a sequential block_table to match.
         """
-        from vllm.v1.attention.ops.turboquant import outlier_dequant_to_staging
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
         )
+        from vllm.v1.attention.ops.turboquant import outlier_dequant_to_staging
 
         dev = kv_cache.device
         num_seqs = attn_metadata.block_table.shape[0]
@@ -648,11 +648,16 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         key_cache, value_cache = kv_cache.unbind(1)
 
         # Sequential block table for staging: staging_bt[s, b] = s * max_blocks + b
-        # The dequant kernel writes to staging_blk = seq_idx * max_blocks + block_pos,
-        # so this mapping lets unified_attention find the right staging blocks.
-        staging_bt = torch.arange(
-            n_staging_blocks, device=dev, dtype=attn_metadata.block_table.dtype,
-        ).reshape(num_seqs, max_blocks_per_seq)
+        # Cached to avoid per-forward allocation (CUDAGraph safety).
+        if (self._staging_block_table is None
+                or self._staging_block_table.numel() < n_staging_blocks):
+            self._staging_block_table = torch.arange(
+                n_staging_blocks, device=dev,
+                dtype=attn_metadata.block_table.dtype,
+            )
+        staging_bt = self._staging_block_table[:n_staging_blocks].reshape(
+            num_seqs, max_blocks_per_seq,
+        )
 
         # Dequant K to staging (original space)
         k_cfg = self._k_outlier_config.to(dev)

@@ -45,7 +45,7 @@ class TestPresetParsing:
         p = parse_tq_preset("turboquant")
         assert p.k_bits == 8
         assert p.v_bits == 8
-        assert p.qjl
+        assert not p.qjl  # MSE-only by default (QJL hurts attention)
 
     def test_invalid_format(self):
         with pytest.raises(ValueError):

@@ -1589,6 +1589,26 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        # TurboQuant: auto-populate boundary layer skip list
+        skip_layers = list(self.kv_cache_dtype_skip_layers)
+        if not skip_layers:
+            import vllm.envs as envs
+            boundary = envs.VLLM_TURBOQUANT_BOUNDARY_LAYERS
+            if boundary > 0 and resolved_cache_dtype.startswith("tq-"):
+                n_layers = getattr(
+                    model_config.hf_config, "num_hidden_layers", 0
+                )
+                if n_layers > 0:
+                    for i in range(boundary):
+                        skip_layers.append(str(i))
+                        if n_layers - 1 - i > i:
+                            skip_layers.append(str(n_layers - 1 - i))
+                    logger.info(
+                        "TurboQuant: auto-skipping boundary layers %s "
+                        "(VLLM_TURBOQUANT_BOUNDARY_LAYERS=%d)",
+                        skip_layers, boundary,
+                    )
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -1600,7 +1620,7 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             calculate_kv_scales=self.calculate_kv_scales,
-            kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
+            kv_cache_dtype_skip_layers=skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,

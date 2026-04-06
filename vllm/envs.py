@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_BITS: int = 0
     VLLM_TURBOQUANT_QJL: bool = False
     VLLM_TURBOQUANT_OUTLIER_BITS: str = ""
+    VLLM_TURBOQUANT_BOUNDARY_LAYERS: int = 0
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -521,6 +522,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for 2.5-bit avg. Empty string = disabled (uniform bits).
     "VLLM_TURBOQUANT_OUTLIER_BITS":
         lambda: os.getenv("VLLM_TURBOQUANT_OUTLIER_BITS", ""),
+    # Number of boundary layers to skip quantization for TurboQuant.
+    # First/last N layers use bf16 passthrough (most sensitive to noise).
+    "VLLM_TURBOQUANT_BOUNDARY_LAYERS":
+        lambda: int(os.getenv("VLLM_TURBOQUANT_BOUNDARY_LAYERS", "0")),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),

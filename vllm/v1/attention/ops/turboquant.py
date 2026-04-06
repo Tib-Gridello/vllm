@@ -1467,8 +1467,10 @@ def _outlier_unpack_kernel(
 
     for slot in range(BLOCK_SIZE):
         # Load dual norms
-        on_off = phys_blk * stride_on_blk + slot * stride_on_slot + head * stride_on_head
-        rn_off = phys_blk * stride_rn_blk + slot * stride_rn_slot + head * stride_rn_head
+        on_off = (phys_blk * stride_on_blk + slot * stride_on_slot
+                  + head * stride_on_head)
+        rn_off = (phys_blk * stride_rn_blk + slot * stride_rn_slot
+                  + head * stride_rn_head)
         norm_out = tl.load(out_norms_ptr + on_off)
         norm_reg = tl.load(reg_norms_ptr + rn_off)
 
