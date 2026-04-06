@@ -1098,12 +1098,13 @@ def turboquant_reshape_and_cache(
 def rotate_query(query: torch.Tensor, R_T: torch.Tensor) -> torch.Tensor:
     """Rotate query by R: q_rot = q @ R^T (batch matmul).
 
-    Args:
-        R_T: Pre-transposed rotation matrix (contiguous).
+    Uses query's dtype (bf16) directly — no float32 cast. Rotation
+    matrices should be pre-cast to the model dtype at init time.
     """
     shape = query.shape
     d = shape[-1]
-    return (query.float().reshape(-1, d) @ R_T).reshape(shape).to(query.dtype)
+    R_T = R_T.to(query.dtype)
+    return (query.reshape(-1, d) @ R_T).reshape(shape)
 
 
 def inverse_rotate_output(
@@ -1112,11 +1113,12 @@ def inverse_rotate_output(
 ) -> torch.Tensor:
     """Inverse-rotate attention output: out @ R (batch matmul).
 
-    Needed because V is in rotated space.
+    Needed because V is in rotated space. Uses output's dtype directly.
     """
     shape = output.shape
     d = shape[-1]
-    return (output.float().reshape(-1, d) @ R).reshape(shape).to(output.dtype)
+    R = R.to(output.dtype)
+    return (output.reshape(-1, d) @ R).reshape(shape)
 
 
 # ============================================================================
