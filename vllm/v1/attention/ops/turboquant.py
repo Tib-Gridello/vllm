@@ -213,24 +213,36 @@ def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
     """
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
+    signs = (
+        torch.randint(
+            0, 2, (d,), generator=gen, device="cpu", dtype=torch.float32
+        )
+        * 2
+        - 1
+    )
+
     if d > 0 and (d & (d - 1)) == 0:
         # Power of 2: use randomized Hadamard
-        signs = (
-            torch.randint(
-                0, 2, (d,), generator=gen, device="cpu", dtype=torch.float32
-            )
-            * 2
-            - 1
-        )
         H = _hadamard_matrix(d)
         return signs.unsqueeze(1) * H
     else:
-        # Non-power-of-2: random orthogonal via QR
-        A = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
-        Q, R = torch.linalg.qr(A)
-        # Fix sign ambiguity to get a proper rotation (det=+1 or -1 consistently)
-        Q = Q * torch.sign(torch.diag(R)).unsqueeze(0)
-        return Q
+        # Non-power-of-2: block-diagonal randomized Hadamard.
+        # Decompose d into power-of-2 blocks (greedy: largest first).
+        # Each block gets its own Hadamard rotation, ensuring orthogonality
+        # and uniform energy spreading within each block.
+        R = torch.zeros(d, d, dtype=torch.float32, device="cpu")
+        remaining = d
+        offset = 0
+        while remaining > 0:
+            block_size = 1 << (remaining.bit_length() - 1)  # largest pow2 <= remaining
+            H_block = _hadamard_matrix(block_size)
+            block_signs = signs[offset : offset + block_size]
+            R[offset : offset + block_size, offset : offset + block_size] = (
+                block_signs.unsqueeze(1) * H_block
+            )
+            offset += block_size
+            remaining -= block_size
+        return R
 
 
 # ============================================================================
