@@ -1863,9 +1863,10 @@ def turboquant_encode_single(
     # Process ALL tokens (no boolean filtering — CUDAGraph requires
     # deterministic tensor shapes). Invalid slots are skipped by the
     # Triton kernel (slot < 0 → early return).
-    x = tensor.float()
-    nrm = x.norm(dim=-1)
-    x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
+    # Norm in float32 for precision, rotation in input dtype (bf16).
+    nrm = tensor.float().norm(dim=-1)
+    x_hat = tensor / (nrm.unsqueeze(-1).to(tensor.dtype) + 1e-10)
+    R_T = R_T.to(tensor.dtype)
     y = (x_hat.reshape(-1, x_hat.shape[-1]) @ R_T).reshape(x_hat.shape)
 
     log2_levels = math.ceil(math.log2(max(codebook.n_levels, 2)))
