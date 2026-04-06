@@ -161,14 +161,25 @@ def compute_beta_centroids(
     Uses exact numerical integration (scipy) when available, falling back
     to Monte Carlo estimation with n_samples samples.
 
+    Results are cached by (d, n_bits) since they're deterministic.
+
     Returns:
         boundaries: (2^n_bits - 1,) decision boundaries
         centroids: (2^n_bits,) reconstruction centroids
     """
+    cache_key = (d, n_bits)
+    if cache_key in _centroid_cache:
+        return _centroid_cache[cache_key]
     try:
-        return _compute_exact_centroids(d, n_bits, n_iters)
+        result = _compute_exact_centroids(d, n_bits, n_iters)
     except ImportError:
-        return _compute_mc_centroids(d, n_bits, n_iters, n_samples)
+        result = _compute_mc_centroids(d, n_bits, n_iters, n_samples)
+    _centroid_cache[cache_key] = result
+    return result
+
+
+# Module-level cache for computed centroids (keyed by (d, n_bits))
+_centroid_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _hadamard_matrix(d: int) -> torch.Tensor:
