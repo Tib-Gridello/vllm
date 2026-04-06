@@ -1087,6 +1087,501 @@ def _turboquant_encode_byte_kernel(
 
 
 # ============================================================================
+# Outlier Encode Kernel (Triton: quantize + mixed pack + scatter)
+# ============================================================================
+
+
+@triton.jit
+def _outlier_encode_kernel(
+    # Rotated outlier subgroup (after split, normalize, rotate in PyTorch)
+    out_rotated_ptr,
+    stride_or_tok: tl.int64,
+    stride_or_head: tl.int64,
+    stride_or_dim: tl.int64,
+    # Rotated regular subgroup
+    reg_rotated_ptr,
+    stride_rr_tok: tl.int64,
+    stride_rr_head: tl.int64,
+    stride_rr_dim: tl.int64,
+    # Packed cache output
+    cache_ptr,
+    stride_c_blk: tl.int64,
+    stride_c_slot: tl.int64,
+    stride_c_head: tl.int64,
+    stride_c_dim: tl.int64,
+    # Outlier norms output (float32 strided view)
+    out_norms_ptr,
+    stride_on_blk: tl.int64,
+    stride_on_slot: tl.int64,
+    stride_on_head: tl.int64,
+    # Regular norms output (float32 strided view)
+    reg_norms_ptr,
+    stride_rn_blk: tl.int64,
+    stride_rn_slot: tl.int64,
+    stride_rn_head: tl.int64,
+    # Pre-computed per-subgroup norms
+    orig_out_norms_ptr,
+    stride_oon_tok: tl.int64,
+    stride_oon_head: tl.int64,
+    orig_reg_norms_ptr,
+    stride_orn_tok: tl.int64,
+    stride_orn_head: tl.int64,
+    # Slot mapping
+    slot_mapping_ptr,
+    # Outlier quantization params
+    out_boundaries_ptr,
+    out_centroids_ptr,
+    # Regular quantization params
+    reg_boundaries_ptr,
+    reg_centroids_ptr,
+    # Constants
+    BLOCK_SIZE: tl.constexpr,
+    OUTLIER_DIM: tl.constexpr,
+    REGULAR_DIM: tl.constexpr,
+    OUT_HALF_DIM: tl.constexpr,
+    REG_QUARTER_DIM: tl.constexpr,
+    OUT_N_LEVELS: tl.constexpr,
+    REG_N_LEVELS: tl.constexpr,
+    OUT_LOG2: tl.constexpr,
+    REG_LOG2: tl.constexpr,
+    OUT_BYTES: tl.constexpr,
+    REG_BYTES: tl.constexpr,
+):
+    """Fused outlier encode: quantize both groups + nibble/2bit pack + scatter.
+
+    Grid: (num_tokens, num_heads).
+    Each program encodes one token-head pair for both outlier and regular groups.
+    """
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // BLOCK_SIZE
+    off = slot % BLOCK_SIZE
+
+    # --- Outlier group: 4-bit nibble-packed ---
+    out_norm = tl.load(
+        orig_out_norms_ptr + tok * stride_oon_tok + head * stride_oon_head
+    )
+
+    out_base = tok * stride_or_tok + head * stride_or_head
+    offs_out_half = tl.arange(0, OUT_HALF_DIM)
+    offs_out_lo = offs_out_half
+    offs_out_hi = OUT_HALF_DIM + offs_out_half
+
+    y_out_lo = tl.load(
+        out_rotated_ptr + out_base + offs_out_lo * stride_or_dim
+    ).to(tl.float32)
+    y_out_hi = tl.load(
+        out_rotated_ptr + out_base + offs_out_hi * stride_or_dim
+    ).to(tl.float32)
+
+    # Binary search for outlier quantization levels
+    out_n_boundaries: tl.constexpr = OUT_N_LEVELS - 1
+    lo_lo = tl.zeros([OUT_HALF_DIM], dtype=tl.int32)
+    hi_lo = tl.full([OUT_HALF_DIM], out_n_boundaries, dtype=tl.int32)
+    lo_hi = tl.zeros([OUT_HALF_DIM], dtype=tl.int32)
+    hi_hi = tl.full([OUT_HALF_DIM], out_n_boundaries, dtype=tl.int32)
+    for _ in range(OUT_LOG2):
+        mid_lo = (lo_lo + hi_lo) // 2
+        mid_hi = (lo_hi + hi_hi) // 2
+        b_lo = tl.load(out_boundaries_ptr + mid_lo)
+        b_hi = tl.load(out_boundaries_ptr + mid_hi)
+        lo_lo = tl.where(y_out_lo > b_lo, mid_lo + 1, lo_lo)
+        hi_lo = tl.where(y_out_lo > b_lo, hi_lo, mid_lo)
+        lo_hi = tl.where(y_out_hi > b_hi, mid_hi + 1, lo_hi)
+        hi_hi = tl.where(y_out_hi > b_hi, hi_hi, mid_hi)
+    idx_out_lo = lo_lo.to(tl.uint8)
+    idx_out_hi = lo_hi.to(tl.uint8)
+
+    # Nibble pack: lo | (hi << 4)
+    packed_out = idx_out_lo | (idx_out_hi << 4)
+
+    # Norm correction for outlier subgroup
+    c_out_lo = tl.load(out_centroids_ptr + idx_out_lo.to(tl.int32))
+    c_out_hi = tl.load(out_centroids_ptr + idx_out_hi.to(tl.int32))
+    out_cn_sq = tl.sum(c_out_lo * c_out_lo, axis=0) + tl.sum(
+        c_out_hi * c_out_hi, axis=0
+    )
+    out_cn = tl.sqrt(out_cn_sq + 1e-12)
+    corrected_out_norm = out_norm / out_cn
+
+    # Scatter outlier packed nibbles to cache
+    c_base = blk * stride_c_blk + off * stride_c_slot + head * stride_c_head
+    tl.store(cache_ptr + c_base + offs_out_half * stride_c_dim, packed_out)
+
+    # Store corrected outlier norm
+    on_off = blk * stride_on_blk + off * stride_on_slot + head * stride_on_head
+    tl.store(out_norms_ptr + on_off, corrected_out_norm)
+
+    # --- Regular group: 2-bit packed (4 per byte) ---
+    reg_norm = tl.load(
+        orig_reg_norms_ptr + tok * stride_orn_tok + head * stride_orn_head
+    )
+
+    reg_base = tok * stride_rr_tok + head * stride_rr_head
+    offs_reg = tl.arange(0, REGULAR_DIM)
+    y_reg = tl.load(
+        reg_rotated_ptr + reg_base + offs_reg * stride_rr_dim
+    ).to(tl.float32)
+
+    # Binary search for regular quantization levels
+    reg_n_boundaries: tl.constexpr = REG_N_LEVELS - 1
+    lo_r = tl.zeros([REGULAR_DIM], dtype=tl.int32)
+    hi_r = tl.full([REGULAR_DIM], reg_n_boundaries, dtype=tl.int32)
+    for _ in range(REG_LOG2):
+        mid_r = (lo_r + hi_r) // 2
+        b_r = tl.load(reg_boundaries_ptr + mid_r)
+        lo_r = tl.where(y_reg > b_r, mid_r + 1, lo_r)
+        hi_r = tl.where(y_reg > b_r, hi_r, mid_r)
+    idx_reg = lo_r.to(tl.uint8)
+
+    # 2-bit pack: 4 indices per byte via shift + sum
+    # Reshape REGULAR_DIM → (REG_QUARTER_DIM, 4), shift by [0,2,4,6], sum
+    idx_reg_i32 = idx_reg.to(tl.int32)
+    idx_reg_2d = tl.reshape(idx_reg_i32, [REG_QUARTER_DIM, 4])
+    shifts = tl.arange(0, 4) * 2  # [0, 2, 4, 6]
+    packed_reg = tl.sum(idx_reg_2d << shifts[None, :], axis=1).to(tl.uint8)
+
+    # Norm correction for regular subgroup
+    c_reg = tl.load(reg_centroids_ptr + idx_reg.to(tl.int32))
+    reg_cn_sq = tl.sum(c_reg * c_reg, axis=0)
+    reg_cn = tl.sqrt(reg_cn_sq + 1e-12)
+    corrected_reg_norm = reg_norm / reg_cn
+
+    # Scatter regular packed 2-bit bytes to cache (after outlier region)
+    tl.store(
+        cache_ptr + c_base + (OUT_BYTES + tl.arange(0, REG_QUARTER_DIM)) * stride_c_dim,
+        packed_reg,
+    )
+
+    # Store corrected regular norm
+    rn_off = blk * stride_rn_blk + off * stride_rn_slot + head * stride_rn_head
+    tl.store(reg_norms_ptr + rn_off, corrected_reg_norm)
+
+
+def outlier_encode_single(
+    tensor: torch.Tensor,
+    cache: torch.Tensor,
+    out_norms_cache: torch.Tensor,
+    reg_norms_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    config: "OutlierChannelConfig",
+) -> None:
+    """Encode a single tensor (K or V) with outlier channel splitting.
+
+    PyTorch handles channel split, per-group normalization, and rotation
+    (cuBLAS matmul). Triton handles quantization, packing, and scatter.
+
+    CUDAGraph-safe: no boolean indexing, no dynamic shapes. All tokens
+    processed; kernel skips slots < 0.
+    """
+    num_tokens = tensor.shape[0]
+    if num_tokens == 0:
+        return
+
+    dev = tensor.device
+    config_dev = config.to(dev)
+    n_heads = tensor.shape[1]
+
+    # Split channels (static indices — CUDAGraph safe)
+    x_out = tensor.float()[..., config_dev.outlier_idx]  # (T, H, out_dim)
+    x_reg = tensor.float()[..., config_dev.regular_idx]  # (T, H, reg_dim)
+
+    # Per-subgroup L2 norms
+    nrm_out = x_out.norm(dim=-1)  # (T, H)
+    nrm_reg = x_reg.norm(dim=-1)  # (T, H)
+
+    # Normalize each subgroup to unit sphere
+    x_out_hat = x_out / (nrm_out.unsqueeze(-1) + 1e-10)
+    x_reg_hat = x_reg / (nrm_reg.unsqueeze(-1) + 1e-10)
+
+    # Rotate each subgroup (cuBLAS matmul — fast)
+    out_R_T = config_dev.outlier_cb.rotation_matrix_T
+    reg_R_T = config_dev.regular_cb.rotation_matrix_T
+    s_out = x_out_hat.shape
+    s_reg = x_reg_hat.shape
+    y_out = (x_out_hat.reshape(-1, s_out[-1]) @ out_R_T).reshape(s_out)
+    y_reg = (x_reg_hat.reshape(-1, s_reg[-1]) @ reg_R_T).reshape(s_reg)
+
+    # Triton: quantize + pack + scatter
+    out_cb = config_dev.outlier_cb
+    reg_cb = config_dev.regular_cb
+    out_log2 = math.ceil(math.log2(max(out_cb.n_levels, 2)))
+    reg_log2 = math.ceil(math.log2(max(reg_cb.n_levels, 2)))
+    out_half = config_dev.outlier_dim // 2
+    reg_quarter = (config_dev.regular_dim + 3) // 4
+    out_bytes = out_half  # nibble-packed = half the coordinates
+
+    grid = (num_tokens, n_heads)
+    _outlier_encode_kernel[grid](
+        y_out, y_out.stride(0), y_out.stride(1), y_out.stride(2),
+        y_reg, y_reg.stride(0), y_reg.stride(1), y_reg.stride(2),
+        cache, cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
+        out_norms_cache,
+        out_norms_cache.stride(0), out_norms_cache.stride(1), out_norms_cache.stride(2),
+        reg_norms_cache,
+        reg_norms_cache.stride(0), reg_norms_cache.stride(1), reg_norms_cache.stride(2),
+        nrm_out, nrm_out.stride(0), nrm_out.stride(1),
+        nrm_reg, nrm_reg.stride(0), nrm_reg.stride(1),
+        slot_mapping,
+        out_cb.boundaries, out_cb.centroids,
+        reg_cb.boundaries, reg_cb.centroids,
+        BLOCK_SIZE=cache.shape[1],
+        OUTLIER_DIM=config_dev.outlier_dim,
+        REGULAR_DIM=config_dev.regular_dim,
+        OUT_HALF_DIM=out_half,
+        REG_QUARTER_DIM=reg_quarter,
+        OUT_N_LEVELS=out_cb.n_levels,
+        REG_N_LEVELS=reg_cb.n_levels,
+        OUT_LOG2=out_log2,
+        REG_LOG2=reg_log2,
+        OUT_BYTES=out_bytes,
+        REG_BYTES=reg_quarter,
+    )
+
+
+# ============================================================================
+# Outlier Unpack Kernel (Triton: unpack + centroid lookup + norm scale)
+# ============================================================================
+
+
+@triton.jit
+def _outlier_unpack_kernel(
+    # TQ cache (packed indices)
+    cache_ptr,
+    stride_c_blk: tl.int64,
+    stride_c_slot: tl.int64,
+    stride_c_head: tl.int64,
+    stride_c_dim: tl.int64,
+    # Dual norms (float32 strided views)
+    out_norms_ptr,
+    stride_on_blk: tl.int64,
+    stride_on_slot: tl.int64,
+    stride_on_head: tl.int64,
+    reg_norms_ptr,
+    stride_rn_blk: tl.int64,
+    stride_rn_slot: tl.int64,
+    stride_rn_head: tl.int64,
+    # Centroids
+    out_centroids_ptr,
+    reg_centroids_ptr,
+    # Output: rotated-space centroid values * norm
+    out_result_ptr,
+    stride_or_blk: tl.int64,
+    stride_or_slot: tl.int64,
+    stride_or_head: tl.int64,
+    stride_or_dim: tl.int64,
+    reg_result_ptr,
+    stride_rr_blk: tl.int64,
+    stride_rr_slot: tl.int64,
+    stride_rr_head: tl.int64,
+    stride_rr_dim: tl.int64,
+    # Block table
+    block_table_ptr,
+    stride_bt_seq: tl.int64,
+    stride_bt_pos: tl.int64,
+    seq_lens_ptr,
+    # Grid info
+    max_blocks_per_seq: tl.int64,
+    num_seqs: tl.int64,
+    # Constants
+    BLOCK_SIZE: tl.constexpr,
+    OUTLIER_DIM: tl.constexpr,
+    REGULAR_DIM: tl.constexpr,
+    OUT_HALF_DIM: tl.constexpr,
+    REG_QUARTER_DIM: tl.constexpr,
+    OUT_BYTES: tl.constexpr,
+):
+    """Unpack outlier cache: read packed indices, lookup centroids, scale by norms.
+
+    Grid: (num_seqs * max_blocks_per_seq, num_kv_heads).
+    Each program handles one (seq_block, head), looping over BLOCK_SIZE slots.
+    Output is in ROTATED space (caller does inverse rotation via cuBLAS).
+    """
+    prog_id = tl.program_id(0)
+    head = tl.program_id(1)
+
+    seq_idx = prog_id // max_blocks_per_seq
+    block_pos = prog_id % max_blocks_per_seq
+
+    if seq_idx >= num_seqs:
+        return
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    n_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    if block_pos >= n_blocks:
+        return
+
+    phys_blk = tl.load(
+        block_table_ptr + seq_idx * stride_bt_seq + block_pos * stride_bt_pos
+    ).to(tl.int64)
+    staging_blk = seq_idx * max_blocks_per_seq + block_pos
+
+    for slot in range(BLOCK_SIZE):
+        # Load dual norms
+        on_off = phys_blk * stride_on_blk + slot * stride_on_slot + head * stride_on_head
+        rn_off = phys_blk * stride_rn_blk + slot * stride_rn_slot + head * stride_rn_head
+        norm_out = tl.load(out_norms_ptr + on_off)
+        norm_reg = tl.load(reg_norms_ptr + rn_off)
+
+        # --- Outlier: unpack nibbles → centroid lookup → scale ---
+        c_base = (
+            phys_blk * stride_c_blk
+            + slot * stride_c_slot
+            + head * stride_c_head
+        )
+        offs_half = tl.arange(0, OUT_HALF_DIM)
+        packed = tl.load(
+            cache_ptr + c_base + offs_half * stride_c_dim
+        )
+        idx_lo = (packed & 0x0F).to(tl.int32)
+        idx_hi = ((packed >> 4) & 0x0F).to(tl.int32)
+        c_lo = tl.load(out_centroids_ptr + idx_lo)
+        c_hi = tl.load(out_centroids_ptr + idx_hi)
+
+        # Write outlier centroid values * norm to output buffer
+        o_base = (
+            staging_blk * stride_or_blk
+            + slot * stride_or_slot
+            + head * stride_or_head
+        )
+        tl.store(
+            out_result_ptr + o_base + offs_half * stride_or_dim,
+            (norm_out * c_lo).to(tl.float32),
+        )
+        tl.store(
+            out_result_ptr + o_base + (OUT_HALF_DIM + offs_half) * stride_or_dim,
+            (norm_out * c_hi).to(tl.float32),
+        )
+
+        # --- Regular: unpack 2-bit → centroid lookup → scale ---
+        reg_byte_offs = tl.arange(0, REG_QUARTER_DIM)
+        reg_packed = tl.load(
+            cache_ptr + c_base + (OUT_BYTES + reg_byte_offs) * stride_c_dim
+        )
+
+        # Unpack 4 indices per byte
+        r_base = (
+            staging_blk * stride_rr_blk
+            + slot * stride_rr_slot
+            + head * stride_rr_head
+        )
+        for bit_pair in range(4):
+            shift = bit_pair * 2
+            idx_r = ((reg_packed.to(tl.int32) >> shift) & 0x03)
+            c_r = tl.load(reg_centroids_ptr + idx_r)
+            dim_offs = reg_byte_offs * 4 + bit_pair
+            # Only store if within REGULAR_DIM
+            mask = dim_offs < REGULAR_DIM
+            tl.store(
+                reg_result_ptr + r_base + dim_offs * stride_rr_dim,
+                (norm_reg * c_r).to(tl.float32),
+                mask=mask,
+            )
+
+
+def outlier_dequant_to_staging(
+    cache: torch.Tensor,
+    out_norms: torch.Tensor,
+    reg_norms: torch.Tensor,
+    staging: torch.Tensor,
+    config: "OutlierChannelConfig",
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks_per_seq: int,
+    out_rotated_buf: torch.Tensor,
+    reg_rotated_buf: torch.Tensor,
+) -> None:
+    """Decompress outlier TQ cache to bf16 staging buffer.
+
+    Three-step pipeline:
+    1. Triton kernel: unpack indices, lookup centroids, scale by norms
+       → writes to intermediate rotated-space buffers
+    2. PyTorch (cuBLAS): inverse-rotate each subgroup
+    3. PyTorch: scatter to staging buffer at original channel positions
+
+    Args:
+        cache: (num_blocks, block_size, nkv, padded_dim) uint8
+        out_norms: (num_blocks, block_size, nkv) float32 strided view
+        reg_norms: same
+        staging: (max_staging_blocks, block_size, nkv, head_dim) bf16
+        config: OutlierChannelConfig
+        block_table: (num_seqs, max_blocks_per_seq) int32
+        seq_lens: (num_seqs,) int32
+        max_blocks_per_seq: int
+        out_rotated_buf: (max_staging_blocks, block_size, nkv, outlier_dim) f32
+        reg_rotated_buf: (max_staging_blocks, block_size, nkv, regular_dim) f32
+    """
+    num_seqs = block_table.shape[0]
+    if num_seqs == 0:
+        return
+
+    dev = cache.device
+    config_dev = config.to(dev)
+    nkv = cache.shape[2]
+    out_half = config_dev.outlier_dim // 2
+    reg_quarter = (config_dev.regular_dim + 3) // 4
+
+    # Step 1: Triton unpack + centroid lookup + norm scaling
+    grid = (num_seqs * max_blocks_per_seq, nkv)
+    _outlier_unpack_kernel[grid](
+        cache,
+        cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
+        out_norms,
+        out_norms.stride(0), out_norms.stride(1), out_norms.stride(2),
+        reg_norms,
+        reg_norms.stride(0), reg_norms.stride(1), reg_norms.stride(2),
+        config_dev.outlier_cb.centroids,
+        config_dev.regular_cb.centroids,
+        out_rotated_buf,
+        out_rotated_buf.stride(0), out_rotated_buf.stride(1),
+        out_rotated_buf.stride(2), out_rotated_buf.stride(3),
+        reg_rotated_buf,
+        reg_rotated_buf.stride(0), reg_rotated_buf.stride(1),
+        reg_rotated_buf.stride(2), reg_rotated_buf.stride(3),
+        block_table,
+        block_table.stride(0), block_table.stride(1),
+        seq_lens,
+        max_blocks_per_seq=max_blocks_per_seq,
+        num_seqs=num_seqs,
+        BLOCK_SIZE=cache.shape[1],
+        OUTLIER_DIM=config_dev.outlier_dim,
+        REGULAR_DIM=config_dev.regular_dim,
+        OUT_HALF_DIM=out_half,
+        REG_QUARTER_DIM=reg_quarter,
+        OUT_BYTES=out_half,  # nibble-packed = half the coordinates
+    )
+
+    # Step 2: Inverse rotation (cuBLAS matmul — fast, parallel)
+    R_out = config_dev.outlier_cb.rotation_matrix  # (out_dim, out_dim)
+    R_reg = config_dev.regular_cb.rotation_matrix  # (reg_dim, reg_dim)
+
+    n_staging = num_seqs * max_blocks_per_seq
+    block_size = cache.shape[1]
+    out_dim = config_dev.outlier_dim
+    reg_dim = config_dev.regular_dim
+
+    # Reshape for batch matmul, inverse rotate, reshape back
+    out_flat = out_rotated_buf[:n_staging].reshape(-1, out_dim)
+    reg_flat = reg_rotated_buf[:n_staging].reshape(-1, reg_dim)
+    out_orig = (out_flat @ R_out).reshape(n_staging, block_size, nkv, out_dim)
+    reg_orig = (reg_flat @ R_reg).reshape(n_staging, block_size, nkv, reg_dim)
+
+    # Step 3: Scatter to staging at original channel positions
+    staging[:n_staging].zero_()
+    staging[:n_staging, :, :, config_dev.outlier_idx] = out_orig.to(
+        torch.bfloat16
+    )
+    staging[:n_staging, :, :, config_dev.regular_idx] = reg_orig.to(
+        torch.bfloat16
+    )
+
+
+# ============================================================================
 # Encode (PyTorch rotation + Triton quantize/pack/scatter)
 # ============================================================================
 

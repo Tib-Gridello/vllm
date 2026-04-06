@@ -212,6 +212,17 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _v_res_scales: torch.Tensor | None = None
     _norms_dirty: bool = False
 
+    # Outlier mode state
+    _outlier_mode: bool = False
+    _k_out_norms: torch.Tensor | None = None
+    _k_reg_norms: torch.Tensor | None = None
+    _v_out_norms: torch.Tensor | None = None
+    _v_reg_norms: torch.Tensor | None = None
+    _staging_k: torch.Tensor | None = None
+    _staging_v: torch.Tensor | None = None
+    _out_rotated_buf: torch.Tensor | None = None
+    _reg_rotated_buf: torch.Tensor | None = None
+
     def __init__(
         self,
         num_heads: int,
@@ -244,52 +255,87 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         # Parse preset
         self._preset = parse_tq_preset(kv_cache_dtype)
+        self._outlier_mode = self._preset.outlier_mode
 
-        # KV quant mode for unified_attention.
-        # When K and V have different bit widths but both are byte mode (>4),
-        # or both are nibble mode (<=4), the fused kernel handles them with
-        # separate centroid pointers. Mixed byte/nibble K/V is not yet supported.
-        if self._preset.k_byte_mode != self._preset.v_byte_mode:
-            raise NotImplementedError(
-                "Mixed byte/nibble K/V not yet supported. "
-                f"k_bits={self._preset.k_bits} ({'byte' if self._preset.k_byte_mode else 'nibble'}), "
-                f"v_bits={self._preset.v_bits} ({'byte' if self._preset.v_byte_mode else 'nibble'}). "
-                "Both must be >4 (byte mode) or both <=4 (nibble mode)."
+        if self._outlier_mode:
+            # Outlier mode: dequant-first architecture.
+            # Compressed cache → Triton dequant → bf16 staging → standard attention.
+            from vllm.v1.attention.ops.turboquant import OutlierChannelConfig
+
+            self._kv_quant_mode = KVQuantMode.NONE  # staging is bf16
+
+            # k_bits = outlier bits, v_bits = regular bits (preset convention)
+            self._k_outlier_config = OutlierChannelConfig(
+                head_dim=head_size,
+                outlier_ratio=self._preset.outlier_ratio,
+                outlier_bits=self._preset.k_bits,
+                regular_bits=self._preset.v_bits,
+                seed=42,
+                device="cpu",
+            )
+            self._v_outlier_config = OutlierChannelConfig(
+                head_dim=head_size,
+                outlier_ratio=self._preset.outlier_ratio,
+                outlier_bits=self._preset.k_bits,
+                regular_bits=self._preset.v_bits,
+                seed=43,  # different rotation for V
+                device="cpu",
             )
 
-        if self._preset.k_byte_mode:
-            self._kv_quant_mode = KVQuantMode.TURBOQUANT_BYTE
+            logger.info(
+                "TurboQuant backend: preset=%s, outlier_bits=%d, "
+                "regular_bits=%d, outlier_ratio=%.2f, avg_bits=%.1f, "
+                "head_dim=%d, padded_dim=%d, mode=dequant-first",
+                self._preset.name,
+                self._preset.k_bits,
+                self._preset.v_bits,
+                self._preset.outlier_ratio,
+                self._preset.avg_bits_per_dim,
+                head_size,
+                self._preset.padded_cache_dim(head_size),
+            )
         else:
-            self._kv_quant_mode = KVQuantMode.TURBOQUANT
+            # Standard mode: fused attention with inline dequant.
+            if self._preset.k_byte_mode != self._preset.v_byte_mode:
+                raise NotImplementedError(
+                    "Mixed byte/nibble K/V not yet supported. "
+                    f"k_bits={self._preset.k_bits}, "
+                    f"v_bits={self._preset.v_bits}. "
+                    "Both must be >4 (byte) or both <=4 (nibble)."
+                )
 
-        # Create codebooks (separate rotations for K and V)
-        from vllm.v1.attention.ops.turboquant import TurboQuantCodebook
+            if self._preset.k_byte_mode:
+                self._kv_quant_mode = KVQuantMode.TURBOQUANT_BYTE
+            else:
+                self._kv_quant_mode = KVQuantMode.TURBOQUANT
 
-        self._k_codebook = TurboQuantCodebook(
-            n_bits=self._preset.k_bits,
-            head_dim=head_size,
-            seed=42,
-            device="cpu",
-            qjl=self._preset.qjl,
-        )
-        self._v_codebook = TurboQuantCodebook(
-            n_bits=self._preset.v_bits,
-            head_dim=head_size,
-            seed=43,  # different rotation for V
-            device="cpu",
-            qjl=self._preset.qjl,
-        )
+            from vllm.v1.attention.ops.turboquant import TurboQuantCodebook
 
-        logger.info(
-            "TurboQuant backend: preset=%s, k_bits=%d, v_bits=%d, "
-            "qjl=%s, head_dim=%d, padded_dim=%d, fused=True",
-            self._preset.name,
-            self._preset.k_bits,
-            self._preset.v_bits,
-            self._preset.qjl,
-            head_size,
-            self._preset.padded_cache_dim(head_size),
-        )
+            self._k_codebook = TurboQuantCodebook(
+                n_bits=self._preset.k_bits,
+                head_dim=head_size,
+                seed=42,
+                device="cpu",
+                qjl=self._preset.qjl,
+            )
+            self._v_codebook = TurboQuantCodebook(
+                n_bits=self._preset.v_bits,
+                head_dim=head_size,
+                seed=43,
+                device="cpu",
+                qjl=self._preset.qjl,
+            )
+
+            logger.info(
+                "TurboQuant backend: preset=%s, k_bits=%d, v_bits=%d, "
+                "qjl=%s, head_dim=%d, padded_dim=%d, fused=True",
+                self._preset.name,
+                self._preset.k_bits,
+                self._preset.v_bits,
+                self._preset.qjl,
+                head_size,
+                self._preset.padded_cache_dim(head_size),
+            )
 
     # ----- Cache view management -----
 
@@ -297,8 +343,15 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         """Extract norm/sign/res_scale views from cache padding.
 
         Cache shape: (num_blocks, 2, block_size, nkv, padded_dim)
-        Layout per head: [indices | L2 norm (4B) | sign bits | res_scale (4B)]
+        Standard layout: [indices | L2 norm (4B) | sign bits | res_scale (4B)]
+        Outlier layout: [out_indices | reg_indices | out_norm (4B) | reg_norm (4B)]
         """
+        if self._outlier_mode:
+            if self._k_out_norms is not None:
+                return
+            self._ensure_outlier_cache_views(kv_cache)
+            return
+
         if self._k_norms is not None:
             return
 
@@ -366,6 +419,85 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
                 signs.fill_(0)
                 setattr(self, f"{attr_prefix}_signs", signs)
 
+    def _ensure_outlier_cache_views(self, kv_cache: torch.Tensor) -> None:
+        """Extract dual norm views for outlier mode.
+
+        Outlier cache layout per head:
+          [outlier_packed | regular_packed | outlier_norm(4B) | regular_norm(4B)]
+        """
+        num_blocks, _, block_size, nkv, padded_dim = kv_cache.shape
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor(
+            [], dtype=torch.float32, device=kv_cache.device
+        ).set_(raw)
+
+        kv_half_bytes = block_size * nkv * padded_dim
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_dim // 4
+        head_f32 = padded_dim // 4
+
+        # Compute index bytes for outlier layout
+        config = self._k_outlier_config  # same layout for K and V
+        out_bytes = config.outlier_dim // 2  # nibble packed
+        reg_bytes = (config.regular_dim + 3) // 4  # 2-bit packed
+        idx_total = out_bytes + reg_bytes
+
+        # Outlier norm at byte offset idx_total, Regular norm at idx_total + 4
+        out_norm_off_f32 = idx_total // 4
+        reg_norm_off_f32 = (idx_total + 4) // 4
+
+        for kv_idx, attr_prefix in [(0, "_k"), (1, "_v")]:
+            kv_offset_f32 = kv_idx * kv_half_bytes // 4
+
+            out_norms = torch.as_strided(
+                base_f32,
+                size=(num_blocks, block_size, nkv),
+                stride=(full_block_f32, slot_f32, head_f32),
+                storage_offset=kv_offset_f32 + out_norm_off_f32,
+            )
+            out_norms.fill_(0.0)
+            setattr(self, f"{attr_prefix}_out_norms", out_norms)
+
+            reg_norms = torch.as_strided(
+                base_f32,
+                size=(num_blocks, block_size, nkv),
+                stride=(full_block_f32, slot_f32, head_f32),
+                storage_offset=kv_offset_f32 + reg_norm_off_f32,
+            )
+            reg_norms.fill_(0.0)
+            setattr(self, f"{attr_prefix}_reg_norms", reg_norms)
+
+    def _ensure_staging_buffers(self, kv_cache: torch.Tensor) -> None:
+        """Allocate staging buffers for outlier dequant-first mode."""
+        if self._staging_k is not None:
+            return
+
+        num_blocks, _, block_size, nkv, _ = kv_cache.shape
+        head_dim = self.head_size
+        device = kv_cache.device
+
+        # Staging: bf16 paged cache for decompressed data
+        self._staging_k = torch.zeros(
+            (num_blocks, block_size, nkv, head_dim),
+            dtype=torch.bfloat16, device=device,
+        )
+        self._staging_v = torch.zeros(
+            (num_blocks, block_size, nkv, head_dim),
+            dtype=torch.bfloat16, device=device,
+        )
+
+        # Intermediate buffers for rotated centroid values
+        outlier_dim = self._k_outlier_config.outlier_dim
+        regular_dim = self._k_outlier_config.regular_dim
+        self._out_rotated_buf = torch.zeros(
+            (num_blocks, block_size, nkv, outlier_dim),
+            dtype=torch.float32, device=device,
+        )
+        self._reg_rotated_buf = torch.zeros(
+            (num_blocks, block_size, nkv, regular_dim),
+            dtype=torch.float32, device=device,
+        )
+
     def _reset_cache_views(self) -> None:
         self._k_norms = None
         self._v_norms = None
@@ -373,6 +505,10 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._v_signs = None
         self._k_res_scales = None
         self._v_res_scales = None
+        self._k_out_norms = None
+        self._k_reg_norms = None
+        self._v_out_norms = None
+        self._v_reg_norms = None
 
     # ----- Forward (fused attention) -----
 
@@ -402,6 +538,11 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             return output.fill_(0)
 
         self._ensure_cache_views(kv_cache)
+
+        if self._outlier_mode:
+            return self._forward_outlier(
+                query, kv_cache, attn_metadata, output, num_actual_tokens
+            )
 
         from vllm.v1.attention.ops.turboquant import (
             inverse_rotate_output,
@@ -463,6 +604,76 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         return output
 
+    def _forward_outlier(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        output: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> torch.Tensor:
+        """Outlier mode: dequant to staging, then standard attention.
+
+        No Q rotation or output inverse-rotation needed — the staging
+        buffer contains data in the original (unrotated) space.
+        """
+        from vllm.v1.attention.ops.turboquant import outlier_dequant_to_staging
+        from vllm.v1.attention.ops.triton_unified_attention import (
+            unified_attention,
+        )
+
+        self._ensure_staging_buffers(kv_cache)
+        dev = kv_cache.device
+        key_cache, value_cache = kv_cache.unbind(1)
+        max_blocks_per_seq = attn_metadata.block_table.shape[1]
+
+        # Dequant K to staging (original space)
+        k_cfg = self._k_outlier_config.to(dev)
+        outlier_dequant_to_staging(
+            key_cache, self._k_out_norms, self._k_reg_norms,
+            self._staging_k, k_cfg,
+            attn_metadata.block_table, attn_metadata.seq_lens,
+            max_blocks_per_seq,
+            out_rotated_buf=self._out_rotated_buf,
+            reg_rotated_buf=self._reg_rotated_buf,
+        )
+
+        # Dequant V to staging (original space)
+        v_cfg = self._v_outlier_config.to(dev)
+        outlier_dequant_to_staging(
+            value_cache, self._v_out_norms, self._v_reg_norms,
+            self._staging_v, v_cfg,
+            attn_metadata.block_table, attn_metadata.seq_lens,
+            max_blocks_per_seq,
+            out_rotated_buf=self._out_rotated_buf,
+            reg_rotated_buf=self._reg_rotated_buf,
+        )
+
+        # Standard attention on bf16 staging — no rotation needed
+        unified_attention(
+            q=query[:num_actual_tokens],
+            k=self._staging_k,
+            v=self._staging_v,
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            use_alibi_sqrt=self.use_alibi_sqrt,
+            window_size=self.sliding_window,
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            kv_quant_mode=KVQuantMode.NONE,
+        )
+
+        return output
+
     # ----- KV Cache Update -----
 
     def do_kv_cache_update(
@@ -478,32 +689,43 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._reset_cache_views()
         self._ensure_cache_views(kv_cache)
 
-        from vllm.v1.attention.ops.turboquant import turboquant_encode_single
-
         key_cache, value_cache = kv_cache.unbind(1)
         dev = key.device
 
-        assert self._k_norms is not None
-        assert self._v_norms is not None
+        if self._outlier_mode:
+            from vllm.v1.attention.ops.turboquant import outlier_encode_single
 
-        k_cb = self._k_codebook.to(dev)
-        turboquant_encode_single(
-            key,
-            key_cache,
-            self._k_norms,
-            slot_mapping,
-            k_cb,
-            signs_cache=self._k_signs,
-            res_scales_cache=self._k_res_scales,
-        )
+            k_cfg = self._k_outlier_config.to(dev)
+            outlier_encode_single(
+                key, key_cache,
+                self._k_out_norms, self._k_reg_norms,
+                slot_mapping, k_cfg,
+            )
 
-        v_cb = self._v_codebook.to(dev)
-        turboquant_encode_single(
-            value,
-            value_cache,
-            self._v_norms,
-            slot_mapping,
-            v_cb,
-            signs_cache=self._v_signs,
-            res_scales_cache=self._v_res_scales,
-        )
+            v_cfg = self._v_outlier_config.to(dev)
+            outlier_encode_single(
+                value, value_cache,
+                self._v_out_norms, self._v_reg_norms,
+                slot_mapping, v_cfg,
+            )
+        else:
+            from vllm.v1.attention.ops.turboquant import (
+                turboquant_encode_single,
+            )
+
+            assert self._k_norms is not None
+            assert self._v_norms is not None
+
+            k_cb = self._k_codebook.to(dev)
+            turboquant_encode_single(
+                key, key_cache, self._k_norms, slot_mapping, k_cb,
+                signs_cache=self._k_signs,
+                res_scales_cache=self._k_res_scales,
+            )
+
+            v_cb = self._v_codebook.to(dev)
+            turboquant_encode_single(
+                value, value_cache, self._v_norms, slot_mapping, v_cb,
+                signs_cache=self._v_signs,
+                res_scales_cache=self._v_res_scales,
+            )
