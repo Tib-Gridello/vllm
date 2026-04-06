@@ -226,7 +226,7 @@ def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
         return signs.unsqueeze(1) * H
     else:
         # Non-power-of-2: random orthogonal via QR
-        A = torch.randn(d, d, generator=gen, device="cpu")
+        A = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
         Q, R = torch.linalg.qr(A)
         # Fix sign ambiguity to get a proper rotation (det=+1 or -1 consistently)
         Q = Q * torch.sign(torch.diag(R)).unsqueeze(0)
