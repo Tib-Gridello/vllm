@@ -342,18 +342,20 @@ def tq_decode_attention(
     )
 
     grid2 = (batch, num_q_heads)
-    BLOCK_DV = head_dim
+    BLOCK_DV = triton.next_power_of_2(head_dim)
 
     _fwd_kernel_stage2[grid2](
         att_out,
         output,
         lse,
+        seq_lens,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
         output.stride(0),
         output.stride(1),
+        lse.stride(0),
+        NUM_KV_SPLITS=num_kv_splits,
         BLOCK_DV=BLOCK_DV,
         Lv=head_dim,
-        NUM_KV_SPLITS=num_kv_splits,
     )
