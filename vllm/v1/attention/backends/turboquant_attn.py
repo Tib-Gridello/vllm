@@ -245,16 +245,18 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         # Parse preset
         self._preset = parse_tq_preset(kv_cache_dtype)
 
-        # Fused kernel uses single KV_QUANT_MODE for both K and V
-        if self._preset.k_bits != self._preset.v_bits:
+        # KV quant mode for unified_attention.
+        # When K and V have different bit widths but both are byte mode (>4),
+        # or both are nibble mode (<=4), the fused kernel handles them with
+        # separate centroid pointers. Mixed byte/nibble K/V is not yet supported.
+        if self._preset.k_byte_mode != self._preset.v_byte_mode:
             raise NotImplementedError(
-                "Fused TurboQuant attention requires symmetric K/V bits. "
-                f"Got k_bits={self._preset.k_bits}, "
-                f"v_bits={self._preset.v_bits}. "
-                "Use a symmetric preset like tq-k8v8 or tq-k4v4."
+                "Mixed byte/nibble K/V not yet supported. "
+                f"k_bits={self._preset.k_bits} ({'byte' if self._preset.k_byte_mode else 'nibble'}), "
+                f"v_bits={self._preset.v_bits} ({'byte' if self._preset.v_byte_mode else 'nibble'}). "
+                "Both must be >4 (byte mode) or both <=4 (nibble mode)."
             )
 
-        # KV quant mode for unified_attention
         if self._preset.k_byte_mode:
             self._kv_quant_mode = KVQuantMode.TURBOQUANT_BYTE
         else:
@@ -443,6 +445,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             v_descale=None,
             kv_quant_mode=self._kv_quant_mode,
             tq_centroids=k_cb.centroids,
+            tq_v_centroids=v_cb.centroids,
             tq_k_norms=self._k_norms,
             tq_v_norms=self._v_norms,
             tq_k_res_scales=(

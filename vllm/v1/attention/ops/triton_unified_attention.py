@@ -178,7 +178,8 @@ def kernel_unified_attention_2d(
     stride_vs_slot=0,
     stride_vs_head=0,
     # TurboQuant params (KV_QUANT_MODE == 4 nibble, 5 byte)
-    tq_centroids_ptr=None,  # [N_LEVELS] float32
+    tq_centroids_ptr=None,  # [K_N_LEVELS] float32 (K centroids)
+    tq_v_centroids_ptr=None,  # [V_N_LEVELS] float32 (V centroids, may differ from K)
     tq_rotation_signs_ptr=None,  # [HEAD_SIZE] float32
     tq_k_norms_ptr=None,  # [num_blocks, block_size, num_kv_heads] float32
     tq_v_norms_ptr=None,  # same
@@ -435,8 +436,8 @@ def kernel_unified_attention_2d(
                 mask=tile_mask[:, None] & dim_mask_half[None, :], other=0)
             V_lo_idx = (packed_V & 0x0F).to(tl.int32)
             V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
-            V_lo_vals = tl.load(tq_centroids_ptr + V_lo_idx)
-            V_hi_vals = tl.load(tq_centroids_ptr + V_hi_idx)
+            V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
+            V_hi_vals = tl.load(tq_v_centroids_ptr + V_hi_idx)
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
@@ -560,7 +561,7 @@ def kernel_unified_attention_2d(
             V_idx = tl.load(
                 value_cache_ptr + v_offset,
                 mask=tile_mask[:, None] & dim_mask[None, :], other=0)
-            V_vals = tl.load(tq_centroids_ptr + V_idx.to(tl.int32))
+            V_vals = tl.load(tq_v_centroids_ptr + V_idx.to(tl.int32))
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
@@ -853,7 +854,8 @@ def kernel_unified_attention_3d(
     stride_vs_slot=0,
     stride_vs_head=0,
     # TurboQuant params (KV_QUANT_MODE == 4 nibble, 5 byte)
-    tq_centroids_ptr=None,  # [N_LEVELS] float32
+    tq_centroids_ptr=None,  # [K_N_LEVELS] float32 (K centroids)
+    tq_v_centroids_ptr=None,  # [V_N_LEVELS] float32 (V centroids, may differ from K)
     tq_rotation_signs_ptr=None,  # [HEAD_SIZE] float32
     tq_k_norms_ptr=None,  # [num_blocks, block_size, num_kv_heads] float32
     tq_v_norms_ptr=None,  # same
@@ -1111,8 +1113,8 @@ def kernel_unified_attention_3d(
                 mask=tile_mask[:, None] & dim_mask_half[None, :], other=0)
             V_lo_idx = (packed_V & 0x0F).to(tl.int32)
             V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
-            V_lo_vals = tl.load(tq_centroids_ptr + V_lo_idx)
-            V_hi_vals = tl.load(tq_centroids_ptr + V_hi_idx)
+            V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
+            V_hi_vals = tl.load(tq_v_centroids_ptr + V_hi_idx)
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
@@ -1224,7 +1226,7 @@ def kernel_unified_attention_3d(
             V_idx = tl.load(
                 value_cache_ptr + v_offset,
                 mask=tile_mask[:, None] & dim_mask[None, :], other=0)
-            V_vals = tl.load(tq_centroids_ptr + V_idx.to(tl.int32))
+            V_vals = tl.load(tq_v_centroids_ptr + V_idx.to(tl.int32))
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
@@ -1572,7 +1574,8 @@ def unified_attention(
     k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     # TurboQuant params (kv_quant_mode == KVQuantMode.TURBOQUANT)
-    tq_centroids=None,      # [N_LEVELS] float32
+    tq_centroids=None,      # [K_N_LEVELS] float32 (K centroids)
+    tq_v_centroids=None,    # [V_N_LEVELS] float32 (V centroids; None = same as K)
     tq_rotation_signs=None,  # [head_dim] float32
     tq_k_norms=None,        # [num_blocks, block_size, num_kv_heads] float32
     tq_v_norms=None,         # same
@@ -1718,6 +1721,7 @@ def unified_attention(
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
             tq_centroids_ptr=tq_centroids,
+            tq_v_centroids_ptr=tq_v_centroids if tq_v_centroids is not None else tq_centroids,
             tq_rotation_signs_ptr=tq_rotation_signs,
             tq_k_norms_ptr=tq_k_norms,
             tq_v_norms_ptr=tq_v_norms,
@@ -1794,6 +1798,7 @@ def unified_attention(
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
             tq_centroids_ptr=tq_centroids,
+            tq_v_centroids_ptr=tq_v_centroids if tq_v_centroids is not None else tq_centroids,
             tq_rotation_signs_ptr=tq_rotation_signs,
             tq_k_norms_ptr=tq_k_norms,
             tq_v_norms_ptr=tq_v_norms,
