@@ -401,6 +401,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         from vllm.v1.attention.ops.turboquant import (
             inverse_rotate_output,
             rotate_query,
+            sign_bytes_padded,
         )
 
         dev = kv_cache.device
@@ -408,43 +409,82 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         # Rotate query by K's rotation matrix (external, not in kernel)
         k_cb = self._k_codebook.to(dev)
+        v_cb = self._v_codebook.to(dev)
         k_R_T = k_cb.rotation_matrix_T
         q_rot = rotate_query(query[:num_actual_tokens], k_R_T)
 
-        # Fused attention: unified_attention reads compressed cache inline,
-        # looks up centroids, applies norms and QJL correction — no staging.
-        from vllm.v1.attention.ops.triton_unified_attention import (
-            unified_attention,
-        )
+        is_decode = attn_metadata.max_query_len == 1
 
-        v_cb = self._v_codebook.to(dev)
+        if is_decode:
+            # Specialized TQ decode kernel: small tiles, optimized for
+            # centroid lookup. ~2x faster than unified_attention TQ path.
+            from vllm.v1.attention.ops.triton_tq_decode import (
+                tq_decode_attention,
+            )
 
-        unified_attention(
-            q=q_rot,
-            k=key_cache,
-            v=value_cache,
-            out=output[:num_actual_tokens],
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            max_seqlen_q=attn_metadata.max_query_len,
-            seqused_k=attn_metadata.seq_lens,
-            max_seqlen_k=attn_metadata.max_seq_len,
-            softmax_scale=self.scale,
-            causal=True,
-            alibi_slopes=self.alibi_slopes,
-            use_alibi_sqrt=self.use_alibi_sqrt,
-            window_size=self.sliding_window,
-            block_table=attn_metadata.block_table,
-            softcap=self.logits_soft_cap,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            kv_quant_mode=self._kv_quant_mode,
-            tq_centroids=k_cb.centroids,
-            tq_k_norms=self._k_norms,
-            tq_v_norms=self._v_norms,
-            tq_k_res_scales=self._k_res_scales if self._preset.qjl else None,
-            tq_v_res_scales=self._v_res_scales if self._preset.qjl else None,
-        )
+            idx_bytes = (
+                self.head_size
+                if k_cb.byte_mode
+                else self.head_size // 2
+            )
+            sign_offset = idx_bytes + 4  # after indices + norm
+
+            tq_decode_attention(
+                q=q_rot,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                output=output[:num_actual_tokens],
+                centroids=k_cb.centroids,
+                k_norms=self._k_norms,
+                v_norms=self._v_norms,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                sm_scale=self.scale,
+                block_size=key_cache.shape[1],
+                k_res_scales=(
+                    self._k_res_scales if self._preset.qjl else None
+                ),
+                v_res_scales=(
+                    self._v_res_scales if self._preset.qjl else None
+                ),
+                sign_data_offset=sign_offset if self._preset.qjl else 0,
+            )
+        else:
+            # Prefill: use unified_attention with fused TQ dequant
+            from vllm.v1.attention.ops.triton_unified_attention import (
+                unified_attention,
+            )
+
+            unified_attention(
+                q=q_rot,
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                use_alibi_sqrt=self.use_alibi_sqrt,
+                window_size=self.sliding_window,
+                block_table=attn_metadata.block_table,
+                softcap=self.logits_soft_cap,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                kv_quant_mode=self._kv_quant_mode,
+                tq_centroids=k_cb.centroids,
+                tq_k_norms=self._k_norms,
+                tq_v_norms=self._v_norms,
+                tq_k_res_scales=(
+                    self._k_res_scales if self._preset.qjl else None
+                ),
+                tq_v_res_scales=(
+                    self._v_res_scales if self._preset.qjl else None
+                ),
+            )
 
         # Inverse-rotate output (V was in rotated space)
         v_R = v_cb.rotation_matrix
