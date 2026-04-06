@@ -1847,100 +1847,96 @@ def turboquant_encode_single(
 ) -> None:
     """Encode a single tensor (K or V) and scatter into its cache half.
 
-    This is the same algorithm as turboquant_reshape_and_cache but for
-    one tensor at a time, allowing different codebooks for K and V.
+    CUDAGraph-safe: no boolean indexing, no dynamic shapes, no GPU→CPU
+    syncs. All tokens are processed; the Triton kernel skips slots < 0.
     """
     num_tokens = tensor.shape[0]
     if num_tokens == 0:
         return
 
-    valid = slot_mapping >= 0
-    # Don't call valid.any() — it syncs GPU→CPU, breaking CUDAGraph.
-    # The Triton kernel handles invalid slots (slot < 0 → early return).
-    valid_slots = slot_mapping[valid]
     qjl = codebook.qjl
     R_T = codebook.rotation_matrix_T
+    n_heads = tensor.shape[1]
 
-    x = tensor[valid].float()
+    # Process ALL tokens (no boolean filtering — CUDAGraph requires
+    # deterministic tensor shapes). Invalid slots are skipped by the
+    # Triton kernel (slot < 0 → early return).
+    x = tensor.float()
     nrm = x.norm(dim=-1)
     x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
-    orig_shape = x_hat.shape
-    y = (x_hat.reshape(-1, orig_shape[-1]) @ R_T).reshape(orig_shape)
+    y = (x_hat.reshape(-1, x_hat.shape[-1]) @ R_T).reshape(x_hat.shape)
 
-    n_valid = x.shape[0]
-    n_heads = x.shape[1]
     log2_levels = math.ceil(math.log2(max(codebook.n_levels, 2)))
 
-    if n_valid > 0:
-        grid = (n_valid, n_heads)
-        if codebook.byte_mode:
-            _turboquant_encode_byte_kernel[grid](
-                y,
-                y.stride(0),
-                y.stride(1),
-                y.stride(2),
-                cache,
-                cache.stride(0),
-                cache.stride(1),
-                cache.stride(2),
-                cache.stride(3),
-                norms_cache,
-                norms_cache.stride(0),
-                norms_cache.stride(1),
-                norms_cache.stride(2),
-                nrm,
-                nrm.stride(0),
-                nrm.stride(1),
-                valid_slots,
-                codebook.boundaries,
-                codebook.centroids,
-                signs_cache if qjl else cache,
-                signs_cache.stride(0) if qjl else 0,
-                signs_cache.stride(1) if qjl else 0,
-                signs_cache.stride(2) if qjl else 0,
-                signs_cache.stride(3) if qjl else 0,
-                res_scales_cache if qjl else norms_cache,
-                res_scales_cache.stride(0) if qjl else 0,
-                res_scales_cache.stride(1) if qjl else 0,
-                res_scales_cache.stride(2) if qjl else 0,
-                BLOCK_SIZE=cache.shape[1],
-                HEAD_DIM=codebook.head_dim,
-                N_LEVELS=codebook.n_levels,
-                QJL_ENABLED=qjl,
-                SIGN_BYTES=(codebook.head_dim + 7) // 8 if qjl else 1,
-                LOG2_LEVELS=log2_levels,
-            )
-        else:
-            hd = codebook.head_dim
-            _turboquant_encode_packed_kernel[grid](
-                y,
-                y.stride(0),
-                y.stride(1),
-                y.stride(2),
-                cache,
-                cache.stride(0),
-                cache.stride(1),
-                cache.stride(2),
-                cache.stride(3),
-                norms_cache,
-                norms_cache.stride(0),
-                norms_cache.stride(1),
-                norms_cache.stride(2),
-                nrm,
-                nrm.stride(0),
-                nrm.stride(1),
-                valid_slots,
-                codebook.boundaries,
-                codebook.centroids,
-                signs_cache if qjl else cache,
-                signs_cache.stride(0) if qjl else 0,
-                signs_cache.stride(1) if qjl else 0,
-                signs_cache.stride(2) if qjl else 0,
-                signs_cache.stride(3) if qjl else 0,
-                res_scales_cache if qjl else norms_cache,
-                res_scales_cache.stride(0) if qjl else 0,
-                res_scales_cache.stride(1) if qjl else 0,
-                res_scales_cache.stride(2) if qjl else 0,
+    grid = (num_tokens, n_heads)
+    if codebook.byte_mode:
+        _turboquant_encode_byte_kernel[grid](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            cache,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            cache.stride(3),
+            norms_cache,
+            norms_cache.stride(0),
+            norms_cache.stride(1),
+            norms_cache.stride(2),
+            nrm,
+            nrm.stride(0),
+            nrm.stride(1),
+            slot_mapping,
+            codebook.boundaries,
+            codebook.centroids,
+            signs_cache if qjl else cache,
+            signs_cache.stride(0) if qjl else 0,
+            signs_cache.stride(1) if qjl else 0,
+            signs_cache.stride(2) if qjl else 0,
+            signs_cache.stride(3) if qjl else 0,
+            res_scales_cache if qjl else norms_cache,
+            res_scales_cache.stride(0) if qjl else 0,
+            res_scales_cache.stride(1) if qjl else 0,
+            res_scales_cache.stride(2) if qjl else 0,
+            BLOCK_SIZE=cache.shape[1],
+            HEAD_DIM=codebook.head_dim,
+            N_LEVELS=codebook.n_levels,
+            QJL_ENABLED=qjl,
+            SIGN_BYTES=(codebook.head_dim + 7) // 8 if qjl else 1,
+            LOG2_LEVELS=log2_levels,
+        )
+    else:
+        hd = codebook.head_dim
+        _turboquant_encode_packed_kernel[grid](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            cache,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            cache.stride(3),
+            norms_cache,
+            norms_cache.stride(0),
+            norms_cache.stride(1),
+            norms_cache.stride(2),
+            nrm,
+            nrm.stride(0),
+            nrm.stride(1),
+            slot_mapping,
+            codebook.boundaries,
+            codebook.centroids,
+            signs_cache if qjl else cache,
+            signs_cache.stride(0) if qjl else 0,
+            signs_cache.stride(1) if qjl else 0,
+            signs_cache.stride(2) if qjl else 0,
+            signs_cache.stride(3) if qjl else 0,
+            res_scales_cache if qjl else norms_cache,
+            res_scales_cache.stride(0) if qjl else 0,
+            res_scales_cache.stride(1) if qjl else 0,
+            res_scales_cache.stride(2) if qjl else 0,
                 BLOCK_SIZE=cache.shape[1],
                 HEAD_DIM=hd,
                 N_LEVELS=codebook.n_levels,
