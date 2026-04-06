@@ -137,30 +137,21 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
+        # TQ presets set page_size_padded to the exact allocation needed
+        # (padded dim already includes norms, signs, res_scales).
+        # Return it directly to avoid double-counting TQ overhead.
+        if self.page_size_padded is not None:
+            return self.page_size_padded
+
         real_page_size = self.real_page_size_bytes
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the
         # raw KV cache allocation so it must be budgeted here.
         if self.kv_quant_mode.is_per_token_head:
             real_page_size += (
-                2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
+                2 * self.block_size * self.num_kv_heads
+                * get_dtype_size(torch.float32)
             )
-        # TurboQuant with old env-var path: add norms + optional QJL.
-        if self.kv_quant_mode.is_turboquant:
-            real_page_size += (
-                2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
-            )
-            import vllm.envs as envs
-            if envs.VLLM_TURBOQUANT_QJL:
-                from vllm.v1.attention.ops.turboquant import sign_bytes_padded
-                sb = sign_bytes_padded(self.head_size)
-                real_page_size += (
-                    2 * self.block_size * self.num_kv_heads
-                    * (sb + get_dtype_size(torch.float32))
-                )
-        if self.page_size_padded is not None:
-            assert self.page_size_padded >= real_page_size
-            return self.page_size_padded
         return real_page_size
 
     @property
