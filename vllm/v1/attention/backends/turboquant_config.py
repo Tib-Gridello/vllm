@@ -63,11 +63,38 @@ class TQPreset:
     def cache_dim_per_head(self, head_dim: int, kv: str = "k") -> int:
         """Bytes per head for K or V cache.
 
-        For byte mode (>4 bit): head_dim bytes (1 index per coord)
-        For nibble mode (<=4 bit): head_dim // 2 bytes (2 indices per byte)
-        Plus 4 bytes for L2 norm (float32).
-        Plus QJL overhead if enabled.
+        Standard mode:
+          For byte mode (>4 bit): head_dim bytes (1 index per coord)
+          For nibble mode (<=4 bit): head_dim // 2 bytes (2 indices per byte)
+          Plus 4 bytes for L2 norm (float32).
+          Plus QJL overhead if enabled.
+
+        Outlier mode:
+          Outlier indices (nibble/2-bit packed) + Regular indices (2-bit packed)
+          Plus 8 bytes for dual L2 norms (2 × float32).
+          Both K and V use the same outlier layout.
         """
+        if self.outlier_mode:
+            outlier_dim = int(head_dim * self.outlier_ratio)
+            regular_dim = head_dim - outlier_dim
+            # k_bits = outlier bits, v_bits = regular bits (preset convention)
+            out_bits = self.k_bits
+            reg_bits = self.v_bits
+            if out_bits <= 2:
+                out_idx_bytes = (outlier_dim + 3) // 4
+            elif out_bits <= 4:
+                out_idx_bytes = outlier_dim // 2
+            else:
+                out_idx_bytes = outlier_dim
+            if reg_bits <= 2:
+                reg_idx_bytes = (regular_dim + 3) // 4
+            elif reg_bits <= 4:
+                reg_idx_bytes = regular_dim // 2
+            else:
+                reg_idx_bytes = regular_dim
+            norm_bytes = 8  # 2 × float32 (outlier_norm + regular_norm)
+            return out_idx_bytes + reg_idx_bytes + norm_bytes
+
         bits = self.k_bits if kv == "k" else self.v_bits
         byte_mode = bits > 4
 

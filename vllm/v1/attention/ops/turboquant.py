@@ -471,7 +471,7 @@ class OutlierChannelConfig:
             reg_bytes = self.regular_dim // 2
         else:
             reg_bytes = self.regular_dim
-        norm_bytes = 4  # float32 L2 norm
+        norm_bytes = 8  # 2 × float32 (outlier_norm + regular_norm)
         return out_bytes + reg_bytes + norm_bytes
 
 
@@ -720,8 +720,10 @@ def outlier_reshape_and_cache(
 def outlier_dequant_paged(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    k_norms: torch.Tensor,
-    v_norms: torch.Tensor,
+    k_out_norms: torch.Tensor,
+    k_reg_norms: torch.Tensor,
+    v_out_norms: torch.Tensor,
+    v_reg_norms: torch.Tensor,
     staging_key: torch.Tensor,
     staging_value: torch.Tensor,
     config: OutlierChannelConfig,
@@ -731,8 +733,9 @@ def outlier_dequant_paged(
 ) -> None:
     """Decompress outlier-mode TQ paged cache to bf16 staging buffer.
 
-    Outputs in ORIGINAL space (inverse-rotates per group, scatters back).
-    No Q rotation or output rotation needed after this.
+    Uses per-subgroup L2 norms (outlier_norm and regular_norm stored
+    separately). Outputs in ORIGINAL space (inverse-rotates per group,
+    scatters back). No Q rotation or output rotation needed after this.
     """
     num_seqs = block_table.shape[0]
     if num_seqs == 0:
@@ -753,9 +756,9 @@ def outlier_dequant_paged(
     out_centroids = config_dev.outlier_cb.centroids
     reg_centroids = config_dev.regular_cb.centroids
 
-    for src_cache, src_norms, staging in [
-        (key_cache, k_norms, staging_key),
-        (value_cache, v_norms, staging_value),
+    for src_cache, src_out_norms, src_reg_norms, staging in [
+        (key_cache, k_out_norms, k_reg_norms, staging_key),
+        (value_cache, v_out_norms, v_reg_norms, staging_value),
     ]:
         for s in range(num_seqs):
             seq_len = seq_lens[s].item()
@@ -765,33 +768,36 @@ def outlier_dequant_paged(
                 staging_blk = s * max_blocks_per_seq + p
                 for slot in range(block_size):
                     for h in range(nkv):
-                        norm = src_norms[phys_blk, slot, h].item()
-                        if norm == 0.0:
+                        norm_out = src_out_norms[phys_blk, slot, h].item()
+                        norm_reg = src_reg_norms[phys_blk, slot, h].item()
+                        if norm_out == 0.0 and norm_reg == 0.0:
                             staging[staging_blk, slot, h, :] = 0.0
                             continue
 
                         # Read outlier packed nibbles
                         out_raw = src_cache[phys_blk, slot, h, :out_bytes]
-                        out_idx = unpack_nibbles(out_raw.unsqueeze(0), out_dim).squeeze(
-                            0
-                        )
+                        out_idx = unpack_nibbles(
+                            out_raw.unsqueeze(0), out_dim
+                        ).squeeze(0)
                         out_vals = out_centroids[out_idx.long()]
 
                         # Read regular 2-bit packed
                         reg_raw = src_cache[
-                            phys_blk, slot, h, out_bytes : out_bytes + reg_bytes
+                            phys_blk, slot, h, out_bytes:out_bytes + reg_bytes
                         ]
-                        reg_idx = unpack_2bit(reg_raw.unsqueeze(0), reg_dim).squeeze(0)
+                        reg_idx = unpack_2bit(
+                            reg_raw.unsqueeze(0), reg_dim
+                        ).squeeze(0)
                         reg_vals = reg_centroids[reg_idx.long()]
 
                         # Inverse-rotate to original space
                         x_out = (out_vals.float() @ R_out).to(torch.float32)
                         x_reg = (reg_vals.float() @ R_reg).to(torch.float32)
 
-                        # Scale by norm and scatter
+                        # Scale by per-subgroup norms and scatter
                         full = torch.zeros(head_dim, device=dev)
-                        full[config_dev.outlier_idx] = norm * x_out
-                        full[config_dev.regular_idx] = norm * x_reg
+                        full[config_dev.outlier_idx] = norm_out * x_out
+                        full[config_dev.regular_idx] = norm_reg * x_reg
                         staging[staging_blk, slot, h] = full.to(torch.bfloat16)
 
 
