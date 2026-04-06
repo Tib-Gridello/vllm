@@ -1592,7 +1592,6 @@ class EngineArgs:
         # TurboQuant: auto-populate boundary layer skip list
         skip_layers = list(self.kv_cache_dtype_skip_layers)
         if not skip_layers:
-            import vllm.envs as envs
             boundary = envs.VLLM_TURBOQUANT_BOUNDARY_LAYERS
             if boundary > 0 and resolved_cache_dtype.startswith("tq-"):
                 n_layers = getattr(
