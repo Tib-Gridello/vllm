@@ -262,16 +262,10 @@ def tq_decode_attention(
     kv_group_num = num_q_heads // num_kv_heads
     qjl = k_res_scales is not None
 
-    # Determine number of KV splits for parallelism
-    # Target ~2x SM count total blocks
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    max_seq = seq_lens.max().item() if seq_lens.numel() > 0 else 1
-    num_kv_splits = max(1, min(128, (2 * sm_count) // (batch * num_q_heads)))
-    # Round to power of 2
-    num_kv_splits = 1 << (num_kv_splits - 1).bit_length()
-    num_kv_splits = min(num_kv_splits, max(1, max_seq // 4))
+    # Fixed split count — avoids GPU→CPU sync from seq_lens.max().item()
+    num_kv_splits = 8
 
-    BLOCK_KV = 4
+    BLOCK_KV = 16
 
     # Intermediate tensor: partial outputs + LSE
     att_out = torch.empty(
