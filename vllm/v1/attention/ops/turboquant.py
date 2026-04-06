@@ -1146,6 +1146,9 @@ def _outlier_encode_kernel(
     REG_LOG2: tl.constexpr,
     OUT_BYTES: tl.constexpr,
     REG_BYTES: tl.constexpr,
+    # Padded dimensions (next power of 2) for tl.arange
+    REGULAR_DIM_PAD: tl.constexpr = 128,
+    REG_QUARTER_DIM_PAD: tl.constexpr = 32,
 ):
     """Fused outlier encode: quantize both groups + nibble/2bit pack + scatter.
 
@@ -1218,44 +1221,55 @@ def _outlier_encode_kernel(
     tl.store(out_norms_ptr + on_off, corrected_out_norm)
 
     # --- Regular group: 2-bit packed (4 per byte) ---
+    # Triton requires tl.arange sizes to be powers of 2.
+    # Pad to REGULAR_DIM_PAD and mask out-of-bounds.
     reg_norm = tl.load(
         orig_reg_norms_ptr + tok * stride_orn_tok + head * stride_orn_head
     )
 
     reg_base = tok * stride_rr_tok + head * stride_rr_head
-    offs_reg = tl.arange(0, REGULAR_DIM)
+    offs_reg = tl.arange(0, REGULAR_DIM_PAD)
+    reg_mask = offs_reg < REGULAR_DIM
     y_reg = tl.load(
-        reg_rotated_ptr + reg_base + offs_reg * stride_rr_dim
+        reg_rotated_ptr + reg_base + offs_reg * stride_rr_dim,
+        mask=reg_mask, other=0.0,
     ).to(tl.float32)
 
     # Binary search for regular quantization levels
     reg_n_boundaries: tl.constexpr = REG_N_LEVELS - 1
-    lo_r = tl.zeros([REGULAR_DIM], dtype=tl.int32)
-    hi_r = tl.full([REGULAR_DIM], reg_n_boundaries, dtype=tl.int32)
+    lo_r = tl.zeros([REGULAR_DIM_PAD], dtype=tl.int32)
+    hi_r = tl.full([REGULAR_DIM_PAD], reg_n_boundaries, dtype=tl.int32)
     for _ in range(REG_LOG2):
         mid_r = (lo_r + hi_r) // 2
         b_r = tl.load(reg_boundaries_ptr + mid_r)
         lo_r = tl.where(y_reg > b_r, mid_r + 1, lo_r)
         hi_r = tl.where(y_reg > b_r, hi_r, mid_r)
-    idx_reg = lo_r.to(tl.uint8)
+    idx_reg = tl.where(reg_mask, lo_r, 0).to(tl.uint8)
 
     # 2-bit pack: 4 indices per byte via shift + sum
-    # Reshape REGULAR_DIM → (REG_QUARTER_DIM, 4), shift by [0,2,4,6], sum
+    # Use padded REG_QUARTER_DIM_PAD for reshape, mask when storing
     idx_reg_i32 = idx_reg.to(tl.int32)
-    idx_reg_2d = tl.reshape(idx_reg_i32, [REG_QUARTER_DIM, 4])
+    # Trim to REGULAR_DIM, pad remainder to 0 for clean packing
+    idx_trimmed = tl.where(offs_reg < REGULAR_DIM, idx_reg_i32, 0)
+    # Reshape to (REG_QUARTER_DIM_PAD, 4)
+    idx_reg_2d = tl.reshape(idx_trimmed, [REG_QUARTER_DIM_PAD, 4])
     shifts = tl.arange(0, 4) * 2  # [0, 2, 4, 6]
     packed_reg = tl.sum(idx_reg_2d << shifts[None, :], axis=1).to(tl.uint8)
 
-    # Norm correction for regular subgroup
+    # Norm correction for regular subgroup (only valid dims)
     c_reg = tl.load(reg_centroids_ptr + idx_reg.to(tl.int32))
-    reg_cn_sq = tl.sum(c_reg * c_reg, axis=0)
+    c_reg_masked = tl.where(reg_mask, c_reg, 0.0)
+    reg_cn_sq = tl.sum(c_reg_masked * c_reg_masked, axis=0)
     reg_cn = tl.sqrt(reg_cn_sq + 1e-12)
     corrected_reg_norm = reg_norm / reg_cn
 
     # Scatter regular packed 2-bit bytes to cache (after outlier region)
+    reg_store_offs = tl.arange(0, REG_QUARTER_DIM_PAD)
+    reg_store_mask = reg_store_offs < REG_QUARTER_DIM
     tl.store(
-        cache_ptr + c_base + (OUT_BYTES + tl.arange(0, REG_QUARTER_DIM)) * stride_c_dim,
+        cache_ptr + c_base + (OUT_BYTES + reg_store_offs) * stride_c_dim,
         packed_reg,
+        mask=reg_store_mask,
     )
 
     # Store corrected regular norm
@@ -1341,6 +1355,8 @@ def outlier_encode_single(
         REG_LOG2=reg_log2,
         OUT_BYTES=out_bytes,
         REG_BYTES=reg_quarter,
+        REGULAR_DIM_PAD=triton.next_power_of_2(config_dev.regular_dim),
+        REG_QUARTER_DIM_PAD=triton.next_power_of_2(reg_quarter),
     )
 
 
@@ -1395,6 +1411,7 @@ def _outlier_unpack_kernel(
     OUT_HALF_DIM: tl.constexpr,
     REG_QUARTER_DIM: tl.constexpr,
     OUT_BYTES: tl.constexpr,
+    REG_QUARTER_DIM_PAD: tl.constexpr = 32,
 ):
     """Unpack outlier cache: read packed indices, lookup centroids, scale by norms.
 
@@ -1459,9 +1476,11 @@ def _outlier_unpack_kernel(
         )
 
         # --- Regular: unpack 2-bit → centroid lookup → scale ---
-        reg_byte_offs = tl.arange(0, REG_QUARTER_DIM)
+        reg_byte_offs = tl.arange(0, REG_QUARTER_DIM_PAD)
+        reg_byte_mask = reg_byte_offs < REG_QUARTER_DIM
         reg_packed = tl.load(
-            cache_ptr + c_base + (OUT_BYTES + reg_byte_offs) * stride_c_dim
+            cache_ptr + c_base + (OUT_BYTES + reg_byte_offs) * stride_c_dim,
+            mask=reg_byte_mask, other=0,
         )
 
         # Unpack 4 indices per byte
@@ -1554,6 +1573,7 @@ def outlier_dequant_to_staging(
         OUT_HALF_DIM=out_half,
         REG_QUARTER_DIM=reg_quarter,
         OUT_BYTES=out_half,  # nibble-packed = half the coordinates
+        REG_QUARTER_DIM_PAD=triton.next_power_of_2(reg_quarter),
     )
 
     # Step 2: Inverse rotation (cuBLAS matmul — fast, parallel)
