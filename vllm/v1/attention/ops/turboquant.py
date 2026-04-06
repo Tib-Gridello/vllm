@@ -1206,7 +1206,9 @@ def _turboquant_dequant_byte_kernel(
         if not is_dirty:
             return
 
-    staging_blk = flat_id
+    # Index staging by physical block (matches unified_attention's
+    # block_table lookup into the staging buffer).
+    staging_blk = phys_blk
     offs_d = tl.arange(0, HEAD_DIM)
 
     for slot in range(BLOCK_SIZE):
@@ -1333,7 +1335,9 @@ def _turboquant_dequant_nibble_kernel(
         if not is_dirty:
             return
 
-    staging_blk = flat_id
+    # Index staging by physical block (matches unified_attention's
+    # block_table lookup into the staging buffer).
+    staging_blk = phys_blk
     offs_lo = tl.arange(0, HALF_DIM)
     offs_full_lo = tl.arange(0, HALF_DIM)
     offs_full_hi = HALF_DIM + tl.arange(0, HALF_DIM)
