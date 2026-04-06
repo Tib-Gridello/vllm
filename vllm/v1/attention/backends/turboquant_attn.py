@@ -717,6 +717,16 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         from vllm.v1.attention.ops.turboquant import OutlierChannelConfig
 
         # key/value: (num_tokens, num_kv_heads, head_dim)
+        num_tokens = key.shape[0]
+
+        # Need enough tokens for reliable variance estimates
+        if num_tokens < 4:
+            logger.debug(
+                "TurboQuant: deferring calibration, only %d tokens "
+                "(need >= 4)", num_tokens,
+            )
+            return False  # Signal caller to keep _needs_calibration = True
+
         # Compute per-channel variance across tokens and heads
         k_float = key.float()
         v_float = value.float()
@@ -733,9 +743,10 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         outlier_mask[top_indices] = True
 
         logger.info(
-            "TurboQuant outlier calibration: top-%d channels by variance "
-            "(var range: [%.4f, %.4f], outlier mean var: %.4f, "
+            "TurboQuant outlier calibration (n_tokens=%d): top-%d channels "
+            "by variance (var range: [%.4f, %.4f], outlier mean var: %.4f, "
             "regular mean var: %.4f)",
+            num_tokens,
             outlier_dim,
             channel_var.min().item(),
             channel_var.max().item(),
@@ -779,8 +790,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._ensure_cache_views(kv_cache)
 
         if self._outlier_mode and self._needs_calibration:
-            self._calibrate_outlier_channels(key, value)
-            self._needs_calibration = False
+            calibrated = self._calibrate_outlier_channels(key, value)
+            if calibrated is not False:
+                self._needs_calibration = False
 
         key_cache, value_cache = kv_cache.unbind(1)
         dev = key.device
