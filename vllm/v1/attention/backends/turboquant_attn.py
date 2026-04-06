@@ -195,16 +195,22 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
       Cache → Triton dequant → bf16 staging → rotate Q → attention → inv-rotate
     """
 
-    # Lazy-initialized state
+    # Lazy-initialized per-instance state (cache views are per-layer
+    # because they point into each layer's KV cache slice)
     _k_norms: torch.Tensor | None = None
     _v_norms: torch.Tensor | None = None
     _k_signs: torch.Tensor | None = None
     _v_signs: torch.Tensor | None = None
     _k_res_scales: torch.Tensor | None = None
     _v_res_scales: torch.Tensor | None = None
-    _staging_key: torch.Tensor | None = None
-    _staging_val: torch.Tensor | None = None
     _norms_dirty: bool = False
+
+    # Shared staging buffers — class-level, reused across all layers.
+    # Only one layer executes at a time, so a single pair suffices.
+    # This avoids allocating N_layers × num_blocks staging (which
+    # exhausts GPU memory and breaks CUDAGraph capture).
+    _shared_staging_key: ClassVar[torch.Tensor | None] = None
+    _shared_staging_val: ClassVar[torch.Tensor | None] = None
 
     def __init__(
         self,
@@ -351,33 +357,36 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._k_res_scales = None
         self._v_res_scales = None
 
+    @classmethod
     def _ensure_staging(
-        self,
+        cls,
         kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor | None = None,
+        head_dim: int,
     ) -> None:
-        """Pre-allocate bf16 staging buffers for dequant-first path.
+        """Pre-allocate shared bf16 staging buffers for dequant-first path.
 
-        Allocates to total num_blocks capacity (the maximum we could
-        ever need). Called from do_kv_cache_update (OUTSIDE CUDAGraph)
-        so forward() never allocates during graph capture/replay.
+        Class-level: one pair of buffers shared by all layers (only one
+        layer is active at a time). Avoids N_layers × num_blocks memory
+        which would exhaust GPU memory and break CUDAGraph capture.
         """
         num_blocks = kv_cache.shape[0]
         block_size = kv_cache.shape[2]
         nkv = kv_cache.shape[3]
 
-        if self._staging_key is not None and self._staging_key.shape[0] >= num_blocks:
+        if (
+            cls._shared_staging_key is not None
+            and cls._shared_staging_key.shape[0] >= num_blocks
+        ):
             return
 
-        head_dim = self.head_size
         device = kv_cache.device
 
-        self._staging_key = torch.zeros(
+        cls._shared_staging_key = torch.zeros(
             (num_blocks, block_size, nkv, head_dim),
             dtype=torch.bfloat16,
             device=device,
         )
-        self._staging_val = torch.zeros(
+        cls._shared_staging_val = torch.zeros(
             (num_blocks, block_size, nkv, head_dim),
             dtype=torch.bfloat16,
             device=device,
@@ -422,17 +431,13 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             turboquant_dequant_single,
         )
 
-        # NOTE: _ensure_staging is called in do_kv_cache_update (before
-        # CUDAGraph capture). By the time forward() is captured/replayed,
-        # staging buffers already exist and are large enough.
-
         dev = kv_cache.device
         key_cache, value_cache = kv_cache.unbind(1)
 
         assert self._k_norms is not None
         assert self._v_norms is not None
-        assert self._staging_key is not None
-        assert self._staging_val is not None
+        assert self._shared_staging_key is not None
+        assert self._shared_staging_val is not None
 
         max_blocks_per_seq = attn_metadata.block_table.shape[1]
 
@@ -440,7 +445,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         turboquant_dequant_single(
             key_cache,
             self._k_norms,
-            self._staging_key,
+            self._shared_staging_key,
             k_cb,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
@@ -453,7 +458,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         turboquant_dequant_single(
             value_cache,
             self._v_norms,
-            self._staging_val,
+            self._shared_staging_val,
             v_cb,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
@@ -475,8 +480,8 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
         unified_attention(
             q=q_rot,
-            k=self._staging_key,
-            v=self._staging_val,
+            k=self._shared_staging_key,
+            v=self._shared_staging_val,
             out=output[:num_actual_tokens],
             cu_seqlens_q=attn_metadata.query_start_loc,
             max_seqlen_q=attn_metadata.max_query_len,
@@ -516,9 +521,8 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._norms_dirty = False
             self._reset_cache_views()
         self._ensure_cache_views(kv_cache)
-        # Pre-allocate staging here (runs OUTSIDE CUDAGraph capture).
-        # forward() then reuses these buffers without allocation.
-        self._ensure_staging(kv_cache)
+        # Pre-allocate shared staging (class-level, one pair for all layers).
+        self._ensure_staging(kv_cache, self.head_size)
 
         from vllm.v1.attention.ops.turboquant import turboquant_encode_single
 
