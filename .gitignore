@@ -262,6 +262,5 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 /test_outlier_gpu.py
 /TURBOQUANT_HANDOFF.md
 
-# TurboQuant untracked internal files (standalone utilities, not imported)
+# Internal files (standalone utilities)
 vllm/compilation/passes/fusion/swiglu_mlp_fusion.py
-vllm/v1/attention/ops/turboquant_calibrate.py
