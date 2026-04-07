@@ -50,6 +50,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "tq-k8v4": torch.uint8,
     "tq-k4v8": torch.uint8,
     "tq-k4v2o": torch.uint8,
+    "tq-k4v2o50": torch.uint8,
     "tq-k2v2": torch.uint8,
 }
 

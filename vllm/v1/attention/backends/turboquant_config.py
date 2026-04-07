@@ -126,7 +126,8 @@ class TQPreset:
 
 
 # Regex for parsing preset strings
-_TQ_PATTERN = re.compile(r"^tq-k(\d+)v(\d+)(-qjl)?(o|-o)?$")
+# Outlier suffix: 'o' (default 25%), 'o50' (50%), 'o75' (75%)
+_TQ_PATTERN = re.compile(r"^tq-k(\d+)v(\d+)(-qjl)?(o(\d+)?)?$")
 
 
 # Backward compat: old "turboquant" string maps to best-quality preset.
@@ -153,11 +154,14 @@ def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
     v_bits = int(m.group(2))
     qjl = m.group(3) is not None
     outlier = m.group(4) is not None
+    outlier_pct = int(m.group(5)) if m.group(5) else 25
 
     if not (2 <= k_bits <= 8):
         raise ValueError(f"k_bits must be 2-8, got {k_bits}")
     if not (2 <= v_bits <= 8):
         raise ValueError(f"v_bits must be 2-8, got {v_bits}")
+    if outlier and not (10 <= outlier_pct <= 75):
+        raise ValueError(f"outlier ratio must be 10-75%, got {outlier_pct}")
 
     return TQPreset(
         name=kv_cache_dtype,
@@ -165,6 +169,7 @@ def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
         v_bits=v_bits,
         qjl=qjl,
         outlier_mode=outlier,
+        outlier_ratio=outlier_pct / 100.0 if outlier else 0.25,
     )
 
 

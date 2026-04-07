@@ -34,6 +34,7 @@ CacheDType = Literal[
     "tq-k8v4",
     "tq-k4v8",
     "tq-k4v2o",
+    "tq-k4v2o50",
     "tq-k2v2",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
