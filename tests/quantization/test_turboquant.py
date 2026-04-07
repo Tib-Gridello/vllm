@@ -651,7 +651,8 @@ class TestOutlierChannels:
         assert config.outlier_dim == 32
         assert config.regular_dim == 96
         assert abs(config.avg_bits - 2.5) < 0.01
-        assert config.cache_bytes_per_head() == 44
+        # 16 (nibble outlier) + 24 (2-bit regular) + 8 (dual norms) = 48
+        assert config.cache_bytes_per_head() == 48
 
     def test_outlier_encode_decode_roundtrip(self):
         torch.manual_seed(42)
@@ -659,12 +660,8 @@ class TestOutlierChannels:
             head_dim=128, outlier_bits=4, regular_bits=2, device="cpu"
         )
         tensor = torch.randn(50, 128)
-        out_idx, reg_idx, out_norms, reg_norms = outlier_encode_ref(
-            tensor, config
-        )
-        decoded = outlier_decode_ref(
-            out_idx, reg_idx, out_norms, reg_norms, config
-        )
+        out_idx, reg_idx, out_norms, reg_norms = outlier_encode_ref(tensor, config)
+        decoded = outlier_decode_ref(out_idx, reg_idx, out_norms, reg_norms, config)
         cos = torch.nn.functional.cosine_similarity(tensor, decoded.float(), dim=-1)
         # 2.5-bit outlier mode on random data (no calibration)
         # Lower threshold because channels are split without calibration
@@ -677,12 +674,8 @@ class TestOutlierChannels:
             head_dim=128, outlier_bits=6, regular_bits=3, device="cpu"
         )
         tensor = torch.randn(100, 128)
-        out_idx, reg_idx, out_norms, reg_norms = outlier_encode_ref(
-            tensor, config
-        )
-        decoded = outlier_decode_ref(
-            out_idx, reg_idx, out_norms, reg_norms, config
-        )
+        out_idx, reg_idx, out_norms, reg_norms = outlier_encode_ref(tensor, config)
+        decoded = outlier_decode_ref(out_idx, reg_idx, out_norms, reg_norms, config)
         cos = torch.nn.functional.cosine_similarity(tensor, decoded.float(), dim=-1)
         # 3.5-bit outlier on random data (no calibration targets)
         assert cos.mean() > 0.90, f"Cosine too low: {cos.mean():.4f}"
@@ -992,13 +985,13 @@ class TestDequantPaged:
                             v_sb = cd["v_signs"][phys, slot, h]
                             # Unpack sign bits
                             for d in range(head_dim):
-                                byt = d // 8
+                                bidx = d // 8
                                 bit = d % 8
                                 k_sign = (
-                                    1.0 if ((k_sb[byt].item() >> bit) & 1) else -1.0
+                                    1.0 if ((k_sb[bidx].item() >> bit) & 1) else -1.0
                                 )
                                 v_sign = (
-                                    1.0 if ((v_sb[byt].item() >> bit) & 1) else -1.0
+                                    1.0 if ((v_sb[bidx].item() >> bit) & 1) else -1.0
                                 )
                                 k_vals[d] += k_rs * k_sign
                                 v_vals[d] += v_rs * v_sign

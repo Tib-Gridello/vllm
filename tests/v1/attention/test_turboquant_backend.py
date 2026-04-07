@@ -216,9 +216,9 @@ class TestKVQuantMode:
     def test_tq_mixed_mode(self):
         from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
 
-        # k=4 (nibble), v=8 (byte) → overall BYTE
-        mode = get_kv_quant_mode("tq-k4v8")
-        assert mode == KVQuantMode.TURBOQUANT_BYTE
+        # k=8 (byte), v=4 (nibble) → MIXED (byte K + nibble V)
+        mode = get_kv_quant_mode("tq-k8v4")
+        assert mode == KVQuantMode.TURBOQUANT_MIXED
 
     def test_alias_mode(self):
         from vllm.v1.kv_cache_interface import get_kv_quant_mode
