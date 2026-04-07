@@ -218,11 +218,14 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _k_reg_norms: torch.Tensor | None = None
     _v_out_norms: torch.Tensor | None = None
     _v_reg_norms: torch.Tensor | None = None
-    _staging_k: torch.Tensor | None = None
-    _staging_v: torch.Tensor | None = None
-    _out_rotated_buf: torch.Tensor | None = None
-    _reg_rotated_buf: torch.Tensor | None = None
     _staging_block_table: torch.Tensor | None = None
+
+    # CLASS-LEVEL shared staging buffers. Layers execute sequentially so a
+    # single set of buffers is safe.  Keyed by (device, block_size, nkv,
+    # head_dim, outlier_dim, regular_dim) to handle heterogeneous configs.
+    _shared_staging: ClassVar[
+        dict[tuple, dict[str, torch.Tensor]]
+    ] = {}
 
     def __init__(
         self,
@@ -477,42 +480,46 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
     def _ensure_staging_buffers(
         self, kv_cache: torch.Tensor, n_staging_blocks: int,
-    ) -> None:
-        """Allocate/resize staging buffers for outlier dequant-first mode.
+    ) -> dict[str, torch.Tensor]:
+        """Get shared staging buffers, allocating/resizing as needed.
 
-        Only allocates for `n_staging_blocks` (= num_seqs * max_blocks_per_seq),
-        NOT the full cache capacity. This keeps memory usage proportional to the
-        active batch, preserving the compression memory savings.
+        Buffers are CLASS-LEVEL shared: all 28 layers reuse the same set
+        since they execute sequentially. This avoids 28x memory overhead.
+
+        Returns dict with keys: staging_k, staging_v, out_rotated, reg_rotated.
         """
         _, _, block_size, nkv, _ = kv_cache.shape
         head_dim = self.head_size
         device = kv_cache.device
-
-        # Only reallocate if current buffers are too small
-        if self._staging_k is not None and self._staging_k.shape[0] >= n_staging_blocks:
-            return
-
-        # Staging: bf16 paged cache for decompressed data
-        self._staging_k = torch.zeros(
-            (n_staging_blocks, block_size, nkv, head_dim),
-            dtype=torch.bfloat16, device=device,
-        )
-        self._staging_v = torch.zeros(
-            (n_staging_blocks, block_size, nkv, head_dim),
-            dtype=torch.bfloat16, device=device,
-        )
-
-        # Intermediate buffers for rotated centroid values
         outlier_dim = self._k_outlier_config.outlier_dim
         regular_dim = self._k_outlier_config.regular_dim
-        self._out_rotated_buf = torch.zeros(
-            (n_staging_blocks, block_size, nkv, outlier_dim),
-            dtype=torch.float32, device=device,
-        )
-        self._reg_rotated_buf = torch.zeros(
-            (n_staging_blocks, block_size, nkv, regular_dim),
-            dtype=torch.float32, device=device,
-        )
+
+        key = (str(device), block_size, nkv, head_dim, outlier_dim, regular_dim)
+        pool = TurboQuantAttentionImpl._shared_staging.get(key)
+
+        if pool is not None and pool["staging_k"].shape[0] >= n_staging_blocks:
+            return pool
+
+        pool = {
+            "staging_k": torch.zeros(
+                (n_staging_blocks, block_size, nkv, head_dim),
+                dtype=torch.bfloat16, device=device,
+            ),
+            "staging_v": torch.zeros(
+                (n_staging_blocks, block_size, nkv, head_dim),
+                dtype=torch.bfloat16, device=device,
+            ),
+            "out_rotated": torch.zeros(
+                (n_staging_blocks, block_size, nkv, outlier_dim),
+                dtype=torch.float32, device=device,
+            ),
+            "reg_rotated": torch.zeros(
+                (n_staging_blocks, block_size, nkv, regular_dim),
+                dtype=torch.float32, device=device,
+            ),
+        }
+        TurboQuantAttentionImpl._shared_staging[key] = pool
+        return pool
 
     def _reset_cache_views(self) -> None:
         self._k_norms = None
@@ -646,7 +653,11 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         max_blocks_per_seq = attn_metadata.block_table.shape[1]
         n_staging_blocks = num_seqs * max_blocks_per_seq
 
-        self._ensure_staging_buffers(kv_cache, n_staging_blocks)
+        pool = self._ensure_staging_buffers(kv_cache, n_staging_blocks)
+        staging_k = pool["staging_k"]
+        staging_v = pool["staging_v"]
+        out_rotated = pool["out_rotated"]
+        reg_rotated = pool["reg_rotated"]
         key_cache, value_cache = kv_cache.unbind(1)
 
         # Sequential block table for staging: staging_bt[s, b] = s * max_blocks + b
@@ -665,29 +676,29 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         k_cfg = self._k_outlier_config.to(dev)
         outlier_dequant_to_staging(
             key_cache, self._k_out_norms, self._k_reg_norms,
-            self._staging_k, k_cfg,
+            staging_k, k_cfg,
             attn_metadata.block_table, attn_metadata.seq_lens,
             max_blocks_per_seq,
-            out_rotated_buf=self._out_rotated_buf,
-            reg_rotated_buf=self._reg_rotated_buf,
+            out_rotated_buf=out_rotated,
+            reg_rotated_buf=reg_rotated,
         )
 
         # Dequant V to staging (original space)
         v_cfg = self._v_outlier_config.to(dev)
         outlier_dequant_to_staging(
             value_cache, self._v_out_norms, self._v_reg_norms,
-            self._staging_v, v_cfg,
+            staging_v, v_cfg,
             attn_metadata.block_table, attn_metadata.seq_lens,
             max_blocks_per_seq,
-            out_rotated_buf=self._out_rotated_buf,
-            reg_rotated_buf=self._reg_rotated_buf,
+            out_rotated_buf=out_rotated,
+            reg_rotated_buf=reg_rotated,
         )
 
         # Standard attention on bf16 staging with sequential block table
         unified_attention(
             q=query[:num_actual_tokens],
-            k=self._staging_k,
-            v=self._staging_v,
+            k=staging_k,
+            v=staging_v,
             out=output[:num_actual_tokens],
             cu_seqlens_q=attn_metadata.query_start_loc,
             max_seqlen_q=attn_metadata.max_query_len,
