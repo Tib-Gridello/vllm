@@ -515,7 +515,13 @@ class Platform:
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:
-            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(
+                cache_config.cache_dtype,
+                # TurboQuant presets (tq-*) all use uint8 storage
+                torch.uint8 if cache_config.cache_dtype.startswith("tq-") else None,
+            )
+            if kv_cache_dtype is None:
+                raise ValueError(f"Unknown cache dtype: {cache_config.cache_dtype}")
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 

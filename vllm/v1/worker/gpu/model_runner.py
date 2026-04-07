@@ -118,9 +118,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
             # Quantized KV cache.
-            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
-                self.cache_config.cache_dtype
-            ]
+            dtype_str = self.cache_config.cache_dtype
+            if dtype_str in STR_DTYPE_TO_TORCH_DTYPE:
+                self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[dtype_str]
+            elif dtype_str.startswith("tq-") or dtype_str == "turboquant":
+                self.kv_cache_dtype = torch.uint8
+            else:
+                raise ValueError(f"Unknown cache dtype: {dtype_str}")
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len

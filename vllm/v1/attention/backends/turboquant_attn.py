@@ -210,6 +210,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _v_signs: torch.Tensor | None = None
     _k_res_scales: torch.Tensor | None = None
     _v_res_scales: torch.Tensor | None = None
+    _k_scales: torch.Tensor | None = None  # FP8 key per-token-head scales
     _norms_dirty: bool = False
 
     # Outlier mode state
@@ -218,14 +219,12 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     _k_reg_norms: torch.Tensor | None = None
     _v_out_norms: torch.Tensor | None = None
     _v_reg_norms: torch.Tensor | None = None
-    _staging_block_table: torch.Tensor | None = None
+    # _staging_block_table removed — physical-block staging uses real block_table
 
     # CLASS-LEVEL shared staging buffers. Layers execute sequentially so a
     # single set of buffers is safe.  Keyed by (device, block_size, nkv,
     # head_dim, outlier_dim, regular_dim) to handle heterogeneous configs.
-    _shared_staging: ClassVar[
-        dict[tuple, dict[str, torch.Tensor]]
-    ] = {}
+    _shared_staging: ClassVar[dict[tuple, dict[str, torch.Tensor]]] = {}
 
     def __init__(
         self,
@@ -303,6 +302,33 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
                 head_size,
                 self._preset.padded_cache_dim(head_size),
             )
+        elif self._preset.k_fp8:
+            # FP8 key mode: FP8 keys (near-lossless) + TQ nibble values.
+            # K stored as fp8_e4m3 + per-token-head float32 scale.
+            # V stored as TQ quantized indices + L2 norm.
+            # No Q rotation needed (K is in original space).
+            self._kv_quant_mode = KVQuantMode.TURBOQUANT_FP8_KEY
+
+            from vllm.v1.attention.ops.turboquant import TurboQuantCodebook
+
+            self._k_codebook = None  # No codebook for FP8 keys
+            self._v_codebook = TurboQuantCodebook(
+                n_bits=self._preset.v_bits,
+                head_dim=head_size,
+                seed=43,
+                device="cpu",
+                qjl=self._preset.qjl,
+            )
+
+            logger.info(
+                "TurboQuant backend: preset=%s, k=FP8, v_bits=%d, "
+                "qjl=%s, head_dim=%d, padded_dim=%d, fused=True",
+                self._preset.name,
+                self._preset.v_bits,
+                self._preset.qjl,
+                head_size,
+                self._preset.padded_cache_dim(head_size),
+            )
         else:
             # Standard mode: fused attention with inline dequant.
             k_byte = self._preset.k_byte_mode
@@ -361,6 +387,12 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             if self._k_out_norms is not None:
                 return
             self._ensure_outlier_cache_views(kv_cache)
+            return
+
+        if self._preset.k_fp8:
+            if self._k_scales is not None:
+                return
+            self._ensure_fp8_key_cache_views(kv_cache)
             return
 
         if self._k_norms is not None:
@@ -438,9 +470,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         """
         num_blocks, _, block_size, nkv, padded_dim = kv_cache.shape
         raw = kv_cache.untyped_storage()
-        base_f32 = torch.tensor(
-            [], dtype=torch.float32, device=kv_cache.device
-        ).set_(raw)
+        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+            raw
+        )
 
         kv_half_bytes = block_size * nkv * padded_dim
         full_block_f32 = 2 * kv_half_bytes // 4
@@ -478,17 +510,73 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             reg_norms.fill_(0.0)
             setattr(self, f"{attr_prefix}_reg_norms", reg_norms)
 
-    def _ensure_staging_buffers(
-        self, kv_cache: torch.Tensor, n_staging_blocks: int,
-    ) -> dict[str, torch.Tensor]:
-        """Get shared staging buffers, allocating/resizing as needed.
+    def _ensure_fp8_key_cache_views(self, kv_cache: torch.Tensor) -> None:
+        """Extract FP8 key scale views and V norm views from cache padding.
 
-        Buffers are CLASS-LEVEL shared: all 28 layers reuse the same set
-        since they execute sequentially. This avoids 28x memory overhead.
-
-        Returns dict with keys: staging_k, staging_v, out_rotated, reg_rotated.
+        FP8 key cache layout per head:
+          [head_dim bytes fp8 data | 4 bytes float32 scale]
+        V cache layout per head (standard TQ):
+          [indices | L2 norm (4B)]
         """
-        _, _, block_size, nkv, _ = kv_cache.shape
+        num_blocks, _, block_size, nkv, padded_dim = kv_cache.shape
+        raw = kv_cache.untyped_storage()
+
+        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+            raw
+        )
+
+        kv_half_bytes = block_size * nkv * padded_dim
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_dim // 4
+        head_f32 = padded_dim // 4
+
+        # K half: FP8 scale at byte offset head_dim (after fp8 data)
+        hd = self.head_size
+        k_scale_off_f32 = hd // 4  # head_dim bytes / 4
+        k_kv_offset_f32 = 0  # K is first half
+
+        k_scales = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=k_kv_offset_f32 + k_scale_off_f32,
+        )
+        k_scales.fill_(1.0)
+        self._k_scales = k_scales
+
+        # V half: standard TQ norm extraction
+        v_cb = self._v_codebook
+        v_idx_bytes = hd if v_cb.byte_mode else hd // 2
+        v_norm_off_f32 = v_idx_bytes // 4
+        v_kv_offset_f32 = kv_half_bytes // 4  # V is second half
+
+        v_norms = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=v_kv_offset_f32 + v_norm_off_f32,
+        )
+        v_norms.fill_(0.0)
+        self._v_norms = v_norms
+
+    def _ensure_staging_buffers(
+        self,
+        kv_cache: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Get shared staging buffers indexed by physical block.
+
+        Physical-block indexing means staging[phys_blk] holds the dequanted
+        data for physical block phys_blk. This is correct for prefix caching
+        (shared blocks share staging data) and enables incremental dequant
+        via per-block dirty tracking.
+
+        Buffers are CLASS-LEVEL shared: all layers reuse the same set
+        since they execute sequentially. This avoids N-layer memory overhead.
+
+        Returns dict with keys: staging_k, staging_v, out_rotated,
+        reg_rotated, dirty_blocks.
+        """
+        num_blocks, _, block_size, nkv, _ = kv_cache.shape
         head_dim = self.head_size
         device = kv_cache.device
         outlier_dim = self._k_outlier_config.outlier_dim
@@ -497,25 +585,36 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         key = (str(device), block_size, nkv, head_dim, outlier_dim, regular_dim)
         pool = TurboQuantAttentionImpl._shared_staging.get(key)
 
-        if pool is not None and pool["staging_k"].shape[0] >= n_staging_blocks:
+        if pool is not None and pool["staging_k"].shape[0] >= num_blocks:
             return pool
 
         pool = {
             "staging_k": torch.zeros(
-                (n_staging_blocks, block_size, nkv, head_dim),
-                dtype=torch.bfloat16, device=device,
+                (num_blocks, block_size, nkv, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
             ),
             "staging_v": torch.zeros(
-                (n_staging_blocks, block_size, nkv, head_dim),
-                dtype=torch.bfloat16, device=device,
+                (num_blocks, block_size, nkv, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
             ),
             "out_rotated": torch.zeros(
-                (n_staging_blocks, block_size, nkv, outlier_dim),
-                dtype=torch.float32, device=device,
+                (num_blocks, block_size, nkv, outlier_dim),
+                dtype=torch.float32,
+                device=device,
             ),
             "reg_rotated": torch.zeros(
-                (n_staging_blocks, block_size, nkv, regular_dim),
-                dtype=torch.float32, device=device,
+                (num_blocks, block_size, nkv, regular_dim),
+                dtype=torch.float32,
+                device=device,
+            ),
+            # Per-physical-block dirty flag. True = needs re-dequant.
+            # Initialized to True so first forward dequants everything.
+            "dirty_blocks": torch.ones(
+                num_blocks,
+                dtype=torch.bool,
+                device=device,
             ),
         }
         TurboQuantAttentionImpl._shared_staging[key] = pool
@@ -528,6 +627,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._v_signs = None
         self._k_res_scales = None
         self._v_res_scales = None
+        self._k_scales = None
         self._k_out_norms = None
         self._k_reg_norms = None
         self._v_out_norms = None
@@ -567,6 +667,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
                 query, kv_cache, attn_metadata, output, num_actual_tokens
             )
 
+        from vllm.v1.attention.ops.triton_unified_attention import (
+            unified_attention,
+        )
         from vllm.v1.attention.ops.turboquant import (
             inverse_rotate_output,
             rotate_query,
@@ -575,17 +678,61 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         dev = kv_cache.device
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Rotate query by K's rotation matrix (external, not in kernel)
+        # Sparse V: skip V accumulation for tiles with negligible
+        # attention weight. Only during decode with long context.
+        svt = (
+            1e-6
+            if attn_metadata.max_query_len == 1 and attn_metadata.max_seq_len > 8192
+            else 0.0
+        )
+
+        if self._preset.k_fp8:
+            # FP8 key mode: no Q rotation (K is in original space).
+            # K = FP8 dequant (cast + scale), V = TQ dequant (centroid lookup).
+            v_cb = self._v_codebook.to(dev)
+
+            unified_attention(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                use_alibi_sqrt=self.use_alibi_sqrt,
+                window_size=self.sliding_window,
+                block_table=attn_metadata.block_table,
+                softcap=self.logits_soft_cap,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                kv_quant_mode=self._kv_quant_mode,
+                tq_centroids=None,  # No K codebook
+                tq_v_centroids=v_cb.centroids,
+                tq_k_norms=self._k_scales,  # FP8 per-token-head scales
+                tq_v_norms=self._v_norms,
+                tq_k_res_scales=None,
+                tq_v_res_scales=None,
+                sparse_v_threshold=svt,
+            )
+
+            # Inverse-rotate output (V was in rotated space)
+            v_R = v_cb.rotation_matrix
+            out_slice = output[:num_actual_tokens]
+            out_slice.copy_(inverse_rotate_output(out_slice, v_R))
+
+            return output
+
+        # Standard TQ mode: rotate Q by K's rotation matrix.
+        assert self._k_codebook is not None
         k_cb = self._k_codebook.to(dev)
         v_cb = self._v_codebook.to(dev)
         k_R_T = k_cb.rotation_matrix_T
         q_rot = rotate_query(query[:num_actual_tokens], k_R_T)
-
-        # Fused attention: unified_attention reads compressed cache inline,
-        # looks up centroids, applies norms and QJL correction — no staging.
-        from vllm.v1.attention.ops.triton_unified_attention import (
-            unified_attention,
-        )
 
         unified_attention(
             q=q_rot,
@@ -611,12 +758,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             tq_v_centroids=v_cb.centroids,
             tq_k_norms=self._k_norms,
             tq_v_norms=self._v_norms,
-            tq_k_res_scales=(
-                self._k_res_scales if self._preset.qjl else None
-            ),
-            tq_v_res_scales=(
-                self._v_res_scales if self._preset.qjl else None
-            ),
+            tq_k_res_scales=(self._k_res_scales if self._preset.qjl else None),
+            tq_v_res_scales=(self._v_res_scales if self._preset.qjl else None),
+            sparse_v_threshold=svt,
         )
 
         # Inverse-rotate output (V was in rotated space)
@@ -639,9 +783,10 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         No Q rotation or output inverse-rotation needed — the staging
         buffer contains data in the original (unrotated) space.
 
-        Uses compacted staging: dequant writes sequentially to
-        staging[seq_idx * max_blocks + block_pos], and unified_attention
-        uses a sequential block_table to match.
+        Physical-block-indexed staging: staging[phys_blk] holds dequanted
+        data for that physical block. Incremental dequant only processes
+        dirty blocks (written since last forward). The real block_table
+        is used directly for attention.
         """
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
@@ -649,52 +794,51 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         from vllm.v1.attention.ops.turboquant import outlier_dequant_to_staging
 
         dev = kv_cache.device
-        num_seqs = attn_metadata.block_table.shape[0]
         max_blocks_per_seq = attn_metadata.block_table.shape[1]
-        n_staging_blocks = num_seqs * max_blocks_per_seq
 
-        pool = self._ensure_staging_buffers(kv_cache, n_staging_blocks)
+        pool = self._ensure_staging_buffers(kv_cache)
         staging_k = pool["staging_k"]
         staging_v = pool["staging_v"]
         out_rotated = pool["out_rotated"]
         reg_rotated = pool["reg_rotated"]
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Sequential block table for staging: staging_bt[s, b] = s * max_blocks + b
-        # Cached to avoid per-forward allocation (CUDAGraph safety).
-        if (self._staging_block_table is None
-                or self._staging_block_table.numel() < n_staging_blocks):
-            self._staging_block_table = torch.arange(
-                n_staging_blocks, device=dev,
-                dtype=attn_metadata.block_table.dtype,
-            )
-        staging_bt = self._staging_block_table[:n_staging_blocks].reshape(
-            num_seqs, max_blocks_per_seq,
-        )
-
-        # Dequant K to staging (original space)
+        # Dequant K to staging (physical-block indexed, original space)
         k_cfg = self._k_outlier_config.to(dev)
         outlier_dequant_to_staging(
-            key_cache, self._k_out_norms, self._k_reg_norms,
-            staging_k, k_cfg,
-            attn_metadata.block_table, attn_metadata.seq_lens,
+            key_cache,
+            self._k_out_norms,
+            self._k_reg_norms,
+            staging_k,
+            k_cfg,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
             max_blocks_per_seq,
             out_rotated_buf=out_rotated,
             reg_rotated_buf=reg_rotated,
         )
 
-        # Dequant V to staging (original space)
+        # Dequant V to staging (physical-block indexed, original space)
         v_cfg = self._v_outlier_config.to(dev)
         outlier_dequant_to_staging(
-            value_cache, self._v_out_norms, self._v_reg_norms,
-            staging_v, v_cfg,
-            attn_metadata.block_table, attn_metadata.seq_lens,
+            value_cache,
+            self._v_out_norms,
+            self._v_reg_norms,
+            staging_v,
+            v_cfg,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
             max_blocks_per_seq,
             out_rotated_buf=out_rotated,
             reg_rotated_buf=reg_rotated,
         )
 
-        # Standard attention on bf16 staging with sequential block table
+        # Clear dirty flags after dequant
+        pool["dirty_blocks"].fill_(False)
+
+        # Attention on bf16 staging with the real block table.
+        # Physical-block indexing: staging[phys_blk] matches block_table
+        # entries directly — no sequential remapping needed.
         unified_attention(
             q=query[:num_actual_tokens],
             k=staging_k,
@@ -709,7 +853,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             alibi_slopes=self.alibi_slopes,
             use_alibi_sqrt=self.use_alibi_sqrt,
             window_size=self.sliding_window,
-            block_table=staging_bt,
+            block_table=attn_metadata.block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,
             k_descale=None,
@@ -722,7 +866,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
     # ----- Outlier Calibration -----
 
     def _calibrate_outlier_channels(
-        self, key: torch.Tensor, value: torch.Tensor,
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
     ) -> None:
         """Calibrate outlier channel selection from actual K/V data.
 
@@ -740,10 +886,10 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         # Need enough tokens for reliable variance estimates
         if num_tokens < 4:
             logger.debug(
-                "TurboQuant: deferring calibration, only %d tokens "
-                "(need >= 4)", num_tokens,
+                "TurboQuant: deferring calibration, only %d tokens (need >= 4)",
+                num_tokens,
             )
-            return False  # Signal caller to keep _needs_calibration = True
+            return  # Caller checks _needs_calibration flag
 
         # Compute per-channel variance across tokens and heads
         k_float = key.float()
@@ -756,7 +902,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         # Select top-k channels by variance
         _, top_indices = channel_var.topk(outlier_dim)
         outlier_mask = torch.zeros(
-            self.head_size, dtype=torch.bool, device=key.device,
+            self.head_size,
+            dtype=torch.bool,
+            device=key.device,
         )
         outlier_mask[top_indices] = True
 
@@ -808,8 +956,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._ensure_cache_views(kv_cache)
 
         if self._outlier_mode and self._needs_calibration:
-            calibrated = self._calibrate_outlier_channels(key, value)
-            if calibrated is not False:
+            self._calibrate_outlier_channels(key, value)
+            # Calibration defers if < 4 tokens; check if it ran
+            if key.shape[0] >= 4:
                 self._needs_calibration = False
 
         key_cache, value_cache = kv_cache.unbind(1)
@@ -820,16 +969,57 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
             k_cfg = self._k_outlier_config.to(dev)
             outlier_encode_single(
-                key, key_cache,
-                self._k_out_norms, self._k_reg_norms,
-                slot_mapping, k_cfg,
+                key,
+                key_cache,
+                self._k_out_norms,
+                self._k_reg_norms,
+                slot_mapping,
+                k_cfg,
             )
 
             v_cfg = self._v_outlier_config.to(dev)
             outlier_encode_single(
-                value, value_cache,
-                self._v_out_norms, self._v_reg_norms,
-                slot_mapping, v_cfg,
+                value,
+                value_cache,
+                self._v_out_norms,
+                self._v_reg_norms,
+                slot_mapping,
+                v_cfg,
+            )
+
+            # Mark written blocks dirty for incremental dequant.
+            # CUDAGraph-safe: no boolean indexing, fixed-size scatter.
+            pool = self._ensure_staging_buffers(kv_cache)
+            block_size = kv_cache.shape[2]
+            valid_slots = slot_mapping.clamp(min=0)
+            dirty_blk_ids = valid_slots // block_size
+            pool["dirty_blocks"][dirty_blk_ids] = True
+        elif self._preset.k_fp8:
+            # FP8 key mode: K → FP8 encode (no rotation), V → TQ encode
+            from vllm.v1.attention.ops.turboquant import (
+                fp8_encode_key,
+                turboquant_encode_single,
+            )
+
+            assert self._k_scales is not None
+            assert self._v_norms is not None
+
+            fp8_encode_key(
+                key,
+                key_cache,
+                self._k_scales,
+                slot_mapping,
+            )
+
+            v_cb = self._v_codebook.to(dev)
+            turboquant_encode_single(
+                value,
+                value_cache,
+                self._v_norms,
+                slot_mapping,
+                v_cb,
+                signs_cache=self._v_signs,
+                res_scales_cache=self._v_res_scales,
             )
         else:
             from vllm.v1.attention.ops.turboquant import (
@@ -838,17 +1028,26 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
 
             assert self._k_norms is not None
             assert self._v_norms is not None
+            assert self._k_codebook is not None
 
             k_cb = self._k_codebook.to(dev)
             turboquant_encode_single(
-                key, key_cache, self._k_norms, slot_mapping, k_cb,
+                key,
+                key_cache,
+                self._k_norms,
+                slot_mapping,
+                k_cb,
                 signs_cache=self._k_signs,
                 res_scales_cache=self._k_res_scales,
             )
 
             v_cb = self._v_codebook.to(dev)
             turboquant_encode_single(
-                value, value_cache, self._v_norms, slot_mapping, v_cb,
+                value,
+                value_cache,
+                self._v_norms,
+                slot_mapping,
+                v_cb,
                 signs_cache=self._v_signs,
                 res_scales_cache=self._v_res_scales,
             )

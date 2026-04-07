@@ -6,14 +6,16 @@ Named presets encode compression settings directly in the kv_cache_dtype
 string, following mgoin's request for "knobs to evaluate different
 compression levels."
 
-Preset format: tq-k{K}v{V}[-qjl][-o]
+Preset format: tq-k{K}[f]v{V}[-qjl][-o]
   K = key bits (2-8)
+  f = FP8 key mode (K stored as fp8_e4m3, V as TQ; requires K=8)
   V = value bits (2-8)
   qjl = sign correction enabled (opt-in, not recommended for attention)
   o = outlier channel mode (mixed-precision: outlier@K bits, regular@2 bits)
 
 Recommended presets:
   tq-k8v8      = 8-bit MSE-only (best quality, 2x compression, default)
+  tq-k8fv4     = FP8 keys + 4-bit TQ values (best quality/compression ratio)
   tq-k4v4      = 4-bit MSE-only (4x compression)
   tq-k4v2o     = outlier mode: 4-bit outlier channels + 2-bit regular (paper)
 
@@ -25,8 +27,9 @@ Use MSE-only with norm correction (enabled by default) instead.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+
+import regex as re
 
 from vllm.v1.attention.ops.turboquant import (
     qjl_padded_dim,
@@ -44,10 +47,11 @@ class TQPreset:
     qjl: bool = False
     outlier_mode: bool = False
     outlier_ratio: float = 0.25
+    k_fp8: bool = False
 
     @property
     def k_byte_mode(self) -> bool:
-        return self.k_bits > 4
+        return self.k_fp8 or self.k_bits > 4
 
     @property
     def v_byte_mode(self) -> bool:
@@ -95,6 +99,10 @@ class TQPreset:
             norm_bytes = 8  # 2 × float32 (outlier_norm + regular_norm)
             return out_idx_bytes + reg_idx_bytes + norm_bytes
 
+        if kv == "k" and self.k_fp8:
+            # FP8 key: head_dim bytes (fp8_e4m3) + 4 bytes (float32 scale)
+            return head_dim + 4
+
         bits = self.k_bits if kv == "k" else self.v_bits
         byte_mode = bits > 4
 
@@ -126,8 +134,8 @@ class TQPreset:
 
 
 # Regex for parsing preset strings
-# Outlier suffix: 'o' (default 25%), 'o50' (50%), 'o75' (75%)
-_TQ_PATTERN = re.compile(r"^tq-k(\d+)v(\d+)(-qjl)?(o(\d+)?)?$")
+# 'f' after K bits = FP8 key mode, outlier suffix: 'o' (25%), 'o50', 'o75'
+_TQ_PATTERN = re.compile(r"^tq-k(\d+)(f?)v(\d+)(-qjl)?(o(\d+)?)?$")
 
 
 # Backward compat: old "turboquant" string maps to best-quality preset.
@@ -147,19 +155,22 @@ def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
     if not m:
         raise ValueError(
             f"Invalid TurboQuant preset: '{kv_cache_dtype}'. "
-            f"Expected format: tq-k{{K}}v{{V}}[-qjl][-o]. "
-            f"Examples: tq-k8v8, tq-k4v4-qjl, tq-k4v2o"
+            f"Expected format: tq-k{{K}}[f]v{{V}}[-qjl][-o]. "
+            f"Examples: tq-k8v8, tq-k8fv4, tq-k4v4-qjl, tq-k4v2o"
         )
     k_bits = int(m.group(1))
-    v_bits = int(m.group(2))
-    qjl = m.group(3) is not None
-    outlier = m.group(4) is not None
-    outlier_pct = int(m.group(5)) if m.group(5) else 25
+    k_fp8 = m.group(2) == "f"
+    v_bits = int(m.group(3))
+    qjl = m.group(4) is not None
+    outlier = m.group(5) is not None
+    outlier_pct = int(m.group(6)) if m.group(6) else 25
 
     if not (2 <= k_bits <= 8):
         raise ValueError(f"k_bits must be 2-8, got {k_bits}")
     if not (2 <= v_bits <= 8):
         raise ValueError(f"v_bits must be 2-8, got {v_bits}")
+    if k_fp8 and k_bits != 8:
+        raise ValueError(f"FP8 key mode requires k_bits=8, got {k_bits}")
     if outlier and not (10 <= outlier_pct <= 75):
         raise ValueError(f"outlier ratio must be 10-75%, got {outlier_pct}")
 
@@ -170,6 +181,7 @@ def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
         qjl=qjl,
         outlier_mode=outlier,
         outlier_ratio=outlier_pct / 100.0 if outlier else 0.25,
+        k_fp8=k_fp8,
     )
 
 

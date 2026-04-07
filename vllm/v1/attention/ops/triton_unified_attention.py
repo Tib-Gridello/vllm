@@ -195,6 +195,9 @@ def kernel_unified_attention_2d(
     tq_res_stride_head: tl.int64 = 0,
     TQ_QJL_ENABLED: tl.constexpr = False,
     TQ_SIGN_DATA_OFFSET: tl.constexpr = 0,
+    # Sparse V: skip V accumulation when max attention weight < threshold.
+    # Only effective for TQ modes where V dequant is expensive.
+    SPARSE_V_THRESHOLD: tl.constexpr = 0.0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -234,16 +237,22 @@ def kernel_unified_attention_2d(
         HALF_D_PAD: tl.constexpr = HEAD_SIZE_PADDED // 2
         offs_d_half = tl.arange(0, HALF_D_PAD)
         dim_mask_half = tl.where(offs_d_half < HALF_D, 1, 0).to(tl.int1)
-        q_base = (query_offset_0[:, None] * query_stride_0
-                  + query_offset_1[:, None] * query_stride_1)
+        q_base = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+        )
         Q_lo = tl.load(
             query_ptr + q_base + offs_d_half[None, :],
-            mask=dim_mask_half[None, :] & q_mask, other=0.0)
+            mask=dim_mask_half[None, :] & q_mask,
+            other=0.0,
+        )
         Q_hi = tl.load(
             query_ptr + q_base + (HALF_D + offs_d_half)[None, :],
-            mask=dim_mask_half[None, :] & q_mask, other=0.0)
-    elif KV_QUANT_MODE == 6:
-        # Mixed: byte K (full Q) + nibble V (need half-dim offsets for V)
+            mask=dim_mask_half[None, :] & q_mask,
+            other=0.0,
+        )
+    elif KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
+        # Mixed: full-dim K + nibble V (need half-dim offsets for V accum)
         HALF_D: tl.constexpr = HEAD_SIZE // 2
         HALF_D_PAD: tl.constexpr = HEAD_SIZE_PADDED // 2
         offs_d_half = tl.arange(0, HALF_D_PAD)
@@ -283,7 +292,7 @@ def kernel_unified_attention_2d(
         ).to(dtype=tl.float32)
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
+    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
         acc_lo = tl.zeros([BLOCK_M, HALF_D_PAD], dtype=tl.float32)
         acc_hi = tl.zeros([BLOCK_M, HALF_D_PAD], dtype=tl.float32)
     else:
@@ -369,10 +378,13 @@ def kernel_unified_attention_2d(
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d_half[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1)
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
             packed_K = tl.load(
                 key_cache_ptr + k_off_half,
-                mask=dim_mask_half[:, None] & tile_mask[None, :], other=0)
+                mask=dim_mask_half[:, None] & tile_mask[None, :],
+                other=0,
+            )
             K_lo_idx = (packed_K & 0x0F).to(tl.int32)
             K_hi_idx = ((packed_K >> 4) & 0x0F).to(tl.int32)
             K_lo_vals = tl.load(tq_centroids_ptr + K_lo_idx)
@@ -380,9 +392,9 @@ def kernel_unified_attention_2d(
             tq_kn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_k_nrm = tl.load(
-                tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_k_nrm = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
             K_lo = (K_lo_vals * tq_k_nrm[None, :]).to(Q_lo.dtype)
             K_hi = (K_hi_vals * tq_k_nrm[None, :]).to(Q_hi.dtype)
 
@@ -392,30 +404,29 @@ def kernel_unified_attention_2d(
                 tq_krs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_k_rs = tl.load(
-                    tq_k_res_scales_ptr + tq_krs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_k_res_scales_ptr + tq_krs_off, mask=tile_mask, other=0.0
+                )
                 # Lo-half signs (coords 0..HALF_D-1)
                 lo_sb_idx = offs_d_half // 8
                 lo_sb_bit = offs_d_half % 8
                 k_slo_off = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[:, None]
-                    * stride_k_cache_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_k_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
                 k_slo_bytes = tl.load(
                     key_cache_ptr + k_slo_off,
                     mask=dim_mask_half[:, None] & tile_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 k_slo_bits = (
-                    (k_slo_bytes.to(tl.int32)
-                     >> lo_sb_bit[:, None].to(tl.int32)) & 1)
-                k_sign_lo = (
-                    2.0 * k_slo_bits.to(tl.float32) - 1.0
-                ).to(Q_lo.dtype)
+                    k_slo_bytes.to(tl.int32) >> lo_sb_bit[:, None].to(tl.int32)
+                ) & 1
+                k_sign_lo = (2.0 * k_slo_bits.to(tl.float32) - 1.0).to(Q_lo.dtype)
                 # Hi-half signs (coords HALF_D..HEAD_SIZE-1)
                 hi_full = HALF_D_QJL + offs_d_half
                 hi_sb_idx = hi_full // 8
@@ -423,20 +434,18 @@ def kernel_unified_attention_2d(
                 k_shi_off = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[:, None]
-                    * stride_k_cache_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_k_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
                 k_shi_bytes = tl.load(
                     key_cache_ptr + k_shi_off,
                     mask=dim_mask_half[:, None] & tile_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 k_shi_bits = (
-                    (k_shi_bytes.to(tl.int32)
-                     >> hi_sb_bit[:, None].to(tl.int32)) & 1)
-                k_sign_hi = (
-                    2.0 * k_shi_bits.to(tl.float32) - 1.0
-                ).to(Q_hi.dtype)
+                    k_shi_bytes.to(tl.int32) >> hi_sb_bit[:, None].to(tl.int32)
+                ) & 1
+                k_sign_hi = (2.0 * k_shi_bits.to(tl.float32) - 1.0).to(Q_hi.dtype)
                 # Apply QJL correction: modify K directly
                 K_lo = K_lo + (k_sign_lo * (tq_k_nrm * tq_k_rs)[None, :]).to(Q_lo.dtype)
                 K_hi = K_hi + (k_sign_hi * (tq_k_nrm * tq_k_rs)[None, :]).to(Q_hi.dtype)
@@ -446,10 +455,13 @@ def kernel_unified_attention_2d(
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d_half[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1)
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
             packed_V = tl.load(
                 value_cache_ptr + v_off_half,
-                mask=tile_mask[:, None] & dim_mask_half[None, :], other=0)
+                mask=tile_mask[:, None] & dim_mask_half[None, :],
+                other=0,
+            )
             V_lo_idx = (packed_V & 0x0F).to(tl.int32)
             V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
             V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
@@ -457,9 +469,9 @@ def kernel_unified_attention_2d(
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_v_nrm = tl.load(
-                tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
             V_lo = (V_lo_vals * tq_v_nrm[:, None]).to(Q_lo.dtype)
             V_hi = (V_hi_vals * tq_v_nrm[:, None]).to(Q_hi.dtype)
 
@@ -468,67 +480,65 @@ def kernel_unified_attention_2d(
                 tq_vrs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_v_rs = tl.load(
-                    tq_v_res_scales_ptr + tq_vrs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_v_res_scales_ptr + tq_vrs_off, mask=tile_mask, other=0.0
+                )
                 # Lo-half V signs
                 v_slo_off = (
                     physical_block_idx[:, None] * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[None, :]
-                    * stride_v_cache_3
-                    + (seq_offset % BLOCK_SIZE)[:, None]
-                    * stride_v_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 v_slo_bytes = tl.load(
                     value_cache_ptr + v_slo_off,
                     mask=tile_mask[:, None] & dim_mask_half[None, :],
-                    other=0)
+                    other=0,
+                )
                 v_slo_bits = (
-                    (v_slo_bytes.to(tl.int32)
-                     >> lo_sb_bit[None, :].to(tl.int32)) & 1)
-                v_slo_vec = (
-                    2.0 * v_slo_bits.to(tl.float32) - 1.0
-                ).to(Q_lo.dtype)
-                V_lo = V_lo + (v_slo_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(
-                    Q_lo.dtype)
+                    v_slo_bytes.to(tl.int32) >> lo_sb_bit[None, :].to(tl.int32)
+                ) & 1
+                v_slo_vec = (2.0 * v_slo_bits.to(tl.float32) - 1.0).to(Q_lo.dtype)
+                V_lo = V_lo + (v_slo_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(Q_lo.dtype)
                 # Hi-half V signs
                 v_shi_off = (
                     physical_block_idx[:, None] * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[None, :]
-                    * stride_v_cache_3
-                    + (seq_offset % BLOCK_SIZE)[:, None]
-                    * stride_v_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 v_shi_bytes = tl.load(
                     value_cache_ptr + v_shi_off,
                     mask=tile_mask[:, None] & dim_mask_half[None, :],
-                    other=0)
+                    other=0,
+                )
                 v_shi_bits = (
-                    (v_shi_bytes.to(tl.int32)
-                     >> hi_sb_bit[None, :].to(tl.int32)) & 1)
-                v_shi_vec = (
-                    2.0 * v_shi_bits.to(tl.float32) - 1.0
-                ).to(Q_hi.dtype)
-                V_hi = V_hi + (v_shi_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(
-                    Q_hi.dtype)
+                    v_shi_bytes.to(tl.int32) >> hi_sb_bit[None, :].to(tl.int32)
+                ) & 1
+                v_shi_vec = (2.0 * v_shi_bits.to(tl.float32) - 1.0).to(Q_hi.dtype)
+                V_hi = V_hi + (v_shi_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(Q_hi.dtype)
         elif KV_QUANT_MODE == 5:  # TurboQuant byte storage (5-8 bit)
             # K: load full-dim uint8 indices (HEAD_SIZE_PADDED, TILE_SIZE)
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1)
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
             K_idx = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :], other=0)
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
             K_vals = tl.load(tq_centroids_ptr + K_idx.to(tl.int32))
             tq_kn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_k_nrm = tl.load(
-                tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_k_nrm = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
             K = (K_vals * tq_k_nrm[None, :]).to(Q.dtype)
             k_token_head_scales = tile_mask.to(tl.float32)  # unused
 
@@ -538,33 +548,32 @@ def kernel_unified_attention_2d(
                 tq_krs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_k_rs = tl.load(
-                    tq_k_res_scales_ptr + tq_krs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_k_res_scales_ptr + tq_krs_off, mask=tile_mask, other=0.0
+                )
                 # Load sign bits via gather: each coordinate d reads
                 # byte d//8 at TQ_SIGN_DATA_OFFSET from each token's
                 # cache slot, then extracts bit d%8.
                 sign_byte_idx = offs_d // 8  # (HEAD_SIZE_PADDED,)
-                sign_bit_idx = offs_d % 8    # (HEAD_SIZE_PADDED,)
+                sign_bit_idx = offs_d % 8  # (HEAD_SIZE_PADDED,)
                 k_sign_offset = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[:, None]
-                    * stride_k_cache_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_k_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
                 k_sign_bytes = tl.load(
                     key_cache_ptr + k_sign_offset,
                     mask=dim_mask[:, None] & tile_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 k_sign_bits = (
-                    (k_sign_bytes.to(tl.int32)
-                     >> sign_bit_idx[:, None].to(tl.int32)) & 1)
+                    k_sign_bytes.to(tl.int32) >> sign_bit_idx[:, None].to(tl.int32)
+                ) & 1
                 # k_sign_vec: (HEAD_SIZE_PADDED, TILE_SIZE) with +/-1
-                k_sign_vec = (
-                    2.0 * k_sign_bits.to(tl.float32) - 1.0
-                ).to(Q.dtype)
+                k_sign_vec = (2.0 * k_sign_bits.to(tl.float32) - 1.0).to(Q.dtype)
                 # Apply QJL correction: modify K directly
                 K = K + (k_sign_vec * (tq_k_nrm * tq_k_rs)[None, :]).to(Q.dtype)
 
@@ -573,17 +582,20 @@ def kernel_unified_attention_2d(
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1)
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
             V_idx = tl.load(
                 value_cache_ptr + v_offset,
-                mask=tile_mask[:, None] & dim_mask[None, :], other=0)
+                mask=tile_mask[:, None] & dim_mask[None, :],
+                other=0,
+            )
             V_vals = tl.load(tq_v_centroids_ptr + V_idx.to(tl.int32))
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_v_nrm = tl.load(
-                tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
             V = (V_vals * tq_v_nrm[:, None]).to(Q.dtype)
             v_token_head_scales = tile_mask.to(tl.float32)  # unused
 
@@ -592,27 +604,26 @@ def kernel_unified_attention_2d(
                 tq_vrs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_v_rs = tl.load(
-                    tq_v_res_scales_ptr + tq_vrs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_v_res_scales_ptr + tq_vrs_off, mask=tile_mask, other=0.0
+                )
                 v_sign_offset = (
                     physical_block_idx[:, None] * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[None, :]
-                    * stride_v_cache_3
-                    + (seq_offset % BLOCK_SIZE)[:, None]
-                    * stride_v_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 v_sign_bytes = tl.load(
                     value_cache_ptr + v_sign_offset,
                     mask=tile_mask[:, None] & dim_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 v_sign_bits = (
-                    (v_sign_bytes.to(tl.int32)
-                     >> sign_bit_idx[None, :].to(tl.int32)) & 1)
-                v_sign_vec = (
-                    2.0 * v_sign_bits.to(tl.float32) - 1.0
-                ).to(Q.dtype)
+                    v_sign_bytes.to(tl.int32) >> sign_bit_idx[None, :].to(tl.int32)
+                ) & 1
+                v_sign_vec = (2.0 * v_sign_bits.to(tl.float32) - 1.0).to(Q.dtype)
                 V = V + (v_sign_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(Q.dtype)
         elif KV_QUANT_MODE == 6:  # TurboQuant mixed: byte K + nibble V
             # K: byte dequant (full dim, like mode 5)
@@ -620,17 +631,20 @@ def kernel_unified_attention_2d(
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1)
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
             K_idx = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :], other=0)
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
             K_vals = tl.load(tq_centroids_ptr + K_idx.to(tl.int32))
             tq_kn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_k_nrm = tl.load(
-                tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_k_nrm = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
             K = (K_vals * tq_k_nrm[None, :]).to(Q.dtype)
             k_token_head_scales = tile_mask.to(tl.float32)
 
@@ -639,10 +653,13 @@ def kernel_unified_attention_2d(
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d_half[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1)
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
             packed_V = tl.load(
                 value_cache_ptr + v_off_half,
-                mask=tile_mask[:, None] & dim_mask_half[None, :], other=0)
+                mask=tile_mask[:, None] & dim_mask_half[None, :],
+                other=0,
+            )
             V_lo_idx = (packed_V & 0x0F).to(tl.int32)
             V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
             V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
@@ -650,9 +667,57 @@ def kernel_unified_attention_2d(
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_v_nrm = tl.load(
-                tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+            V_lo = (V_lo_vals * tq_v_nrm[:, None]).to(Q.dtype)
+            V_hi = (V_hi_vals * tq_v_nrm[:, None]).to(Q.dtype)
+        elif KV_QUANT_MODE == 7:  # FP8 keys + TQ nibble values
+            # K: load FP8 bytes from cache (full dim), cast and scale
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            K_fp8_bytes = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
+            # Load per-token-head FP8 scale from tq_k_norms (repurposed)
+            tq_kn_off = (
+                physical_block_idx * tq_norms_stride_block
+                + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
+                + kv_head_idx * tq_norms_stride_head
+            )
+            k_fp8_scale = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+            # Dequant: cast fp8 to float, multiply by per-token-head scale
+            K = (K_fp8_bytes.to(tl.float32) * k_fp8_scale[None, :]).to(Q.dtype)
+            k_token_head_scales = tile_mask.to(tl.float32)  # unused
+
+            # V: nibble dequant (split halves, like mode 4/6)
+            v_off_half = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d_half[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            packed_V = tl.load(
+                value_cache_ptr + v_off_half,
+                mask=tile_mask[:, None] & dim_mask_half[None, :],
+                other=0,
+            )
+            V_lo_idx = (packed_V & 0x0F).to(tl.int32)
+            V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
+            V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
+            V_hi_vals = tl.load(tq_v_centroids_ptr + V_hi_idx)
+            tq_vn_off = (
+                physical_block_idx * tq_norms_stride_block
+                + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
             V_lo = (V_lo_vals * tq_v_nrm[:, None]).to(Q.dtype)
             V_hi = (V_hi_vals * tq_v_nrm[:, None]).to(Q.dtype)
         else:
@@ -675,10 +740,19 @@ def kernel_unified_attention_2d(
                 other=0.0,
             )
             K, k_token_head_scales = _prepare_kv_tile(
-                K_load, Q, k_scale, k_scale_cache_ptr,
-                physical_block_idx, seq_offset, kv_head_idx,
-                stride_ks_blk, stride_ks_slot, stride_ks_head,
-                tile_mask, BLOCK_SIZE, KV_QUANT_MODE,
+                K_load,
+                Q,
+                k_scale,
+                k_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_ks_blk,
+                stride_ks_slot,
+                stride_ks_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
             )
             # V : (TILE_SIZE, HEAD_SIZE)
             V_load = tl.load(
@@ -687,10 +761,19 @@ def kernel_unified_attention_2d(
                 other=0.0,
             )
             V, v_token_head_scales = _prepare_kv_tile(
-                V_load, Q, v_scale, v_scale_cache_ptr,
-                physical_block_idx, seq_offset, kv_head_idx,
-                stride_vs_blk, stride_vs_slot, stride_vs_head,
-                tile_mask, BLOCK_SIZE, KV_QUANT_MODE,
+                V_load,
+                Q,
+                v_scale,
+                v_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_vs_blk,
+                stride_vs_slot,
+                stride_vs_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
             )
 
         # Compute attention mask: causal by default (key <= query)
@@ -786,7 +869,7 @@ def kernel_unified_attention_2d(
         alpha = tl.exp(M - m_j)
 
         # Rescale accumulators for online softmax.
-        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
             acc_lo = acc_lo * alpha[:, None]
             acc_hi = acc_hi * alpha[:, None]
         else:
@@ -796,42 +879,53 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
-                sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
-                V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
-                V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
-            else:
-                V = tl.where(
-                    (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
-                )
+        # Sparse V: skip V accumulation when all attention weights
+        # in this tile are negligible. L/M are already updated, so the
+        # error is bounded by TILE_SIZE * threshold (< fp16 precision).
+        skip_v_accum = SPARSE_V_THRESHOLD > 0.0 and tl.max(P) < SPARSE_V_THRESHOLD
+        if not skip_v_accum:
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
+                    sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
+                    V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
+                    V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
+                else:
+                    V = tl.where(
+                        (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
+                        V,
+                        0.0,
+                    )
 
-        # Accumulate weighted values.
-        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
-            acc_lo += tl.dot(P.to(V_lo.dtype), V_lo)
-            acc_hi += tl.dot(P.to(V_hi.dtype), V_hi)
-        elif KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+            # Accumulate weighted values.
+            if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
+                acc_lo += tl.dot(P.to(V_lo.dtype), V_lo)
+                acc_hi += tl.dot(P.to(V_hi.dtype), V_hi)
+            elif KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
+                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+                acc += tl.dot(P_v, V)
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
-    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
+    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
         acc_lo = acc_lo / L[:, None]
         acc_hi = acc_hi / L[:, None]
         if USE_FP8:
             out_s = tl.load(out_scale)
             acc_lo = tl.clamp(acc_lo * out_s, FP8_MIN, FP8_MAX)
             acc_hi = tl.clamp(acc_hi * out_s, FP8_MIN, FP8_MAX)
-        out_base = (query_offset_0[:, None] * output_stride_0
-                    + query_offset_1[:, None] * output_stride_1)
+        out_base = (
+            query_offset_0[:, None] * output_stride_0
+            + query_offset_1[:, None] * output_stride_1
+        )
         out_mask = dim_mask_half[None, :] & q_mask
-        tl.store(output_ptr + out_base + offs_d_half[None, :],
-                 acc_lo, mask=out_mask)
-        tl.store(output_ptr + out_base + (HALF_D + offs_d_half)[None, :],
-                 acc_hi, mask=out_mask)
+        tl.store(output_ptr + out_base + offs_d_half[None, :], acc_lo, mask=out_mask)
+        tl.store(
+            output_ptr + out_base + (HALF_D + offs_d_half)[None, :],
+            acc_hi,
+            mask=out_mask,
+        )
     else:
         acc = acc / L[:, None]
         if USE_FP8:
@@ -929,6 +1023,7 @@ def kernel_unified_attention_3d(
     tq_res_stride_head: tl.int64 = 0,
     TQ_QJL_ENABLED: tl.constexpr = False,
     TQ_SIGN_DATA_OFFSET: tl.constexpr = 0,
+    SPARSE_V_THRESHOLD: tl.constexpr = 0.0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -979,16 +1074,22 @@ def kernel_unified_attention_3d(
         HALF_D_PAD: tl.constexpr = HEAD_SIZE_PADDED // 2
         offs_d_half = tl.arange(0, HALF_D_PAD)
         dim_mask_half = tl.where(offs_d_half < HALF_D, 1, 0).to(tl.int1)
-        q_base_3d = (query_offset_0[:, None] * query_stride_0
-                     + query_offset_1[:, None] * query_stride_1)
+        q_base_3d = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+        )
         Q_lo = tl.load(
             query_ptr + q_base_3d + offs_d_half[None, :],
-            mask=dim_mask_half[None, :] & q_mask_3d, other=0.0)
+            mask=dim_mask_half[None, :] & q_mask_3d,
+            other=0.0,
+        )
         Q_hi = tl.load(
             query_ptr + q_base_3d + (HALF_D + offs_d_half)[None, :],
-            mask=dim_mask_half[None, :] & q_mask_3d, other=0.0)
-    elif KV_QUANT_MODE == 6:
-        # Mixed: byte K (full Q) + nibble V (need half-dim offsets for V)
+            mask=dim_mask_half[None, :] & q_mask_3d,
+            other=0.0,
+        )
+    elif KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
+        # Mixed: full-dim K + nibble V (need half-dim offsets for V accum)
         HALF_D: tl.constexpr = HEAD_SIZE // 2
         HALF_D_PAD: tl.constexpr = HEAD_SIZE_PADDED // 2
         offs_d_half = tl.arange(0, HALF_D_PAD)
@@ -1031,7 +1132,7 @@ def kernel_unified_attention_3d(
         M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
+    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
         acc_lo = tl.zeros([BLOCK_M, HALF_D_PAD], dtype=tl.float32)
         acc_hi = tl.zeros([BLOCK_M, HALF_D_PAD], dtype=tl.float32)
     else:
@@ -1111,10 +1212,13 @@ def kernel_unified_attention_3d(
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d_half[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1)
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
             packed_K = tl.load(
                 key_cache_ptr + k_off_half,
-                mask=dim_mask_half[:, None] & tile_mask[None, :], other=0)
+                mask=dim_mask_half[:, None] & tile_mask[None, :],
+                other=0,
+            )
             K_lo_idx = (packed_K & 0x0F).to(tl.int32)
             K_hi_idx = ((packed_K >> 4) & 0x0F).to(tl.int32)
             K_lo_vals = tl.load(tq_centroids_ptr + K_lo_idx)
@@ -1122,9 +1226,9 @@ def kernel_unified_attention_3d(
             tq_kn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_k_nrm = tl.load(
-                tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_k_nrm = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
             K_lo = (K_lo_vals * tq_k_nrm[None, :]).to(Q_lo.dtype)
             K_hi = (K_hi_vals * tq_k_nrm[None, :]).to(Q_hi.dtype)
 
@@ -1134,45 +1238,54 @@ def kernel_unified_attention_3d(
                 tq_krs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_k_rs = tl.load(
-                    tq_k_res_scales_ptr + tq_krs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_k_res_scales_ptr + tq_krs_off, mask=tile_mask, other=0.0
+                )
                 lo_sb_idx = offs_d_half // 8
                 lo_sb_bit = offs_d_half % 8
                 k_slo_off = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[:, None]
-                    * stride_k_cache_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_k_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
                 k_slo_bytes = tl.load(
                     key_cache_ptr + k_slo_off,
                     mask=dim_mask_half[:, None] & tile_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 k_sign_lo = (
-                    2.0 * ((k_slo_bytes.to(tl.int32)
-                            >> lo_sb_bit[:, None].to(tl.int32)) & 1
-                           ).to(tl.float32) - 1.0).to(Q_lo.dtype)
+                    2.0
+                    * (
+                        (k_slo_bytes.to(tl.int32) >> lo_sb_bit[:, None].to(tl.int32))
+                        & 1
+                    ).to(tl.float32)
+                    - 1.0
+                ).to(Q_lo.dtype)
                 hi_full = HALF_D_3D + offs_d_half
                 hi_sb_idx = hi_full // 8
                 hi_sb_bit = hi_full % 8
                 k_shi_off = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[:, None]
-                    * stride_k_cache_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_k_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
                 k_shi_bytes = tl.load(
                     key_cache_ptr + k_shi_off,
                     mask=dim_mask_half[:, None] & tile_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 k_sign_hi = (
-                    2.0 * ((k_shi_bytes.to(tl.int32)
-                            >> hi_sb_bit[:, None].to(tl.int32)) & 1
-                           ).to(tl.float32) - 1.0).to(Q_hi.dtype)
+                    2.0
+                    * (
+                        (k_shi_bytes.to(tl.int32) >> hi_sb_bit[:, None].to(tl.int32))
+                        & 1
+                    ).to(tl.float32)
+                    - 1.0
+                ).to(Q_hi.dtype)
                 # Apply QJL correction: modify K directly
                 K_lo = K_lo + (k_sign_lo * (tq_k_nrm * tq_k_rs)[None, :]).to(Q_lo.dtype)
                 K_hi = K_hi + (k_sign_hi * (tq_k_nrm * tq_k_rs)[None, :]).to(Q_hi.dtype)
@@ -1181,10 +1294,13 @@ def kernel_unified_attention_3d(
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d_half[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1)
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
             packed_V = tl.load(
                 value_cache_ptr + v_off_half,
-                mask=tile_mask[:, None] & dim_mask_half[None, :], other=0)
+                mask=tile_mask[:, None] & dim_mask_half[None, :],
+                other=0,
+            )
             V_lo_idx = (packed_V & 0x0F).to(tl.int32)
             V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
             V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
@@ -1192,9 +1308,9 @@ def kernel_unified_attention_3d(
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_v_nrm = tl.load(
-                tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
             V_lo = (V_lo_vals * tq_v_nrm[:, None]).to(Q_lo.dtype)
             V_hi = (V_hi_vals * tq_v_nrm[:, None]).to(Q_hi.dtype)
 
@@ -1203,60 +1319,70 @@ def kernel_unified_attention_3d(
                 tq_vrs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_v_rs = tl.load(
-                    tq_v_res_scales_ptr + tq_vrs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_v_res_scales_ptr + tq_vrs_off, mask=tile_mask, other=0.0
+                )
                 v_slo_off = (
                     physical_block_idx[:, None] * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[None, :]
-                    * stride_v_cache_3
-                    + (seq_offset % BLOCK_SIZE)[:, None]
-                    * stride_v_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + lo_sb_idx)[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 v_slo_bytes = tl.load(
                     value_cache_ptr + v_slo_off,
                     mask=tile_mask[:, None] & dim_mask_half[None, :],
-                    other=0)
+                    other=0,
+                )
                 v_slo_vec = (
-                    2.0 * ((v_slo_bytes.to(tl.int32)
-                            >> lo_sb_bit[None, :].to(tl.int32)) & 1
-                           ).to(tl.float32) - 1.0).to(Q_lo.dtype)
-                V_lo = V_lo + (v_slo_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(
-                    Q_lo.dtype)
+                    2.0
+                    * (
+                        (v_slo_bytes.to(tl.int32) >> lo_sb_bit[None, :].to(tl.int32))
+                        & 1
+                    ).to(tl.float32)
+                    - 1.0
+                ).to(Q_lo.dtype)
+                V_lo = V_lo + (v_slo_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(Q_lo.dtype)
                 v_shi_off = (
                     physical_block_idx[:, None] * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[None, :]
-                    * stride_v_cache_3
-                    + (seq_offset % BLOCK_SIZE)[:, None]
-                    * stride_v_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + hi_sb_idx)[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 v_shi_bytes = tl.load(
                     value_cache_ptr + v_shi_off,
                     mask=tile_mask[:, None] & dim_mask_half[None, :],
-                    other=0)
+                    other=0,
+                )
                 v_shi_vec = (
-                    2.0 * ((v_shi_bytes.to(tl.int32)
-                            >> hi_sb_bit[None, :].to(tl.int32)) & 1
-                           ).to(tl.float32) - 1.0).to(Q_hi.dtype)
-                V_hi = V_hi + (v_shi_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(
-                    Q_hi.dtype)
+                    2.0
+                    * (
+                        (v_shi_bytes.to(tl.int32) >> hi_sb_bit[None, :].to(tl.int32))
+                        & 1
+                    ).to(tl.float32)
+                    - 1.0
+                ).to(Q_hi.dtype)
+                V_hi = V_hi + (v_shi_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(Q_hi.dtype)
         elif KV_QUANT_MODE == 5:  # TurboQuant byte storage (5-8 bit)
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1)
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
             K_idx = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :], other=0)
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
             K_vals = tl.load(tq_centroids_ptr + K_idx.to(tl.int32))
             tq_kn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_k_nrm = tl.load(
-                tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_k_nrm = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
             K = (K_vals * tq_k_nrm[None, :]).to(Q.dtype)
             k_token_head_scales = tile_mask.to(tl.float32)
 
@@ -1265,30 +1391,29 @@ def kernel_unified_attention_3d(
                 tq_krs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_k_rs = tl.load(
-                    tq_k_res_scales_ptr + tq_krs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_k_res_scales_ptr + tq_krs_off, mask=tile_mask, other=0.0
+                )
                 sign_byte_idx = offs_d // 8
                 sign_bit_idx = offs_d % 8
                 k_sign_offset = (
                     physical_block_idx[None, :] * stride_k_cache_0
                     + kv_head_idx * stride_k_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[:, None]
-                    * stride_k_cache_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_k_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
                 k_sign_bytes = tl.load(
                     key_cache_ptr + k_sign_offset,
                     mask=dim_mask[:, None] & tile_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 k_sign_bits = (
-                    (k_sign_bytes.to(tl.int32)
-                     >> sign_bit_idx[:, None].to(tl.int32)) & 1)
+                    k_sign_bytes.to(tl.int32) >> sign_bit_idx[:, None].to(tl.int32)
+                ) & 1
                 # k_sign_vec: (HEAD_SIZE_PADDED, TILE_SIZE) with +/-1
-                k_sign_vec = (
-                    2.0 * k_sign_bits.to(tl.float32) - 1.0
-                ).to(Q.dtype)
+                k_sign_vec = (2.0 * k_sign_bits.to(tl.float32) - 1.0).to(Q.dtype)
                 # Apply QJL correction: modify K directly
                 K = K + (k_sign_vec * (tq_k_nrm * tq_k_rs)[None, :]).to(Q.dtype)
 
@@ -1296,17 +1421,20 @@ def kernel_unified_attention_3d(
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1)
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
             V_idx = tl.load(
                 value_cache_ptr + v_offset,
-                mask=tile_mask[:, None] & dim_mask[None, :], other=0)
+                mask=tile_mask[:, None] & dim_mask[None, :],
+                other=0,
+            )
             V_vals = tl.load(tq_v_centroids_ptr + V_idx.to(tl.int32))
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_v_nrm = tl.load(
-                tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
             V = (V_vals * tq_v_nrm[:, None]).to(Q.dtype)
             v_token_head_scales = tile_mask.to(tl.float32)
 
@@ -1315,27 +1443,26 @@ def kernel_unified_attention_3d(
                 tq_vrs_off = (
                     physical_block_idx * tq_res_stride_block
                     + (seq_offset % BLOCK_SIZE) * tq_res_stride_slot
-                    + kv_head_idx * tq_res_stride_head)
+                    + kv_head_idx * tq_res_stride_head
+                )
                 tq_v_rs = tl.load(
-                    tq_v_res_scales_ptr + tq_vrs_off,
-                    mask=tile_mask, other=0.0)
+                    tq_v_res_scales_ptr + tq_vrs_off, mask=tile_mask, other=0.0
+                )
                 v_sign_offset = (
                     physical_block_idx[:, None] * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
-                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[None, :]
-                    * stride_v_cache_3
-                    + (seq_offset % BLOCK_SIZE)[:, None]
-                    * stride_v_cache_1)
+                    + (TQ_SIGN_DATA_OFFSET + sign_byte_idx)[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
                 v_sign_bytes = tl.load(
                     value_cache_ptr + v_sign_offset,
                     mask=tile_mask[:, None] & dim_mask[None, :],
-                    other=0)
+                    other=0,
+                )
                 v_sign_bits = (
-                    (v_sign_bytes.to(tl.int32)
-                     >> sign_bit_idx[None, :].to(tl.int32)) & 1)
-                v_sign_vec = (
-                    2.0 * v_sign_bits.to(tl.float32) - 1.0
-                ).to(Q.dtype)
+                    v_sign_bytes.to(tl.int32) >> sign_bit_idx[None, :].to(tl.int32)
+                ) & 1
+                v_sign_vec = (2.0 * v_sign_bits.to(tl.float32) - 1.0).to(Q.dtype)
                 V = V + (v_sign_vec * (tq_v_nrm * tq_v_rs)[:, None]).to(Q.dtype)
         elif KV_QUANT_MODE == 6:  # TurboQuant mixed: byte K + nibble V
             # K: byte dequant (full dim, like mode 5)
@@ -1343,17 +1470,20 @@ def kernel_unified_attention_3d(
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1)
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
             K_idx = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :], other=0)
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
             K_vals = tl.load(tq_centroids_ptr + K_idx.to(tl.int32))
             tq_kn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_k_nrm = tl.load(
-                tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_k_nrm = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
             K = (K_vals * tq_k_nrm[None, :]).to(Q.dtype)
             k_token_head_scales = tile_mask.to(tl.float32)
 
@@ -1362,10 +1492,13 @@ def kernel_unified_attention_3d(
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d_half[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1)
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
             packed_V = tl.load(
                 value_cache_ptr + v_off_half,
-                mask=tile_mask[:, None] & dim_mask_half[None, :], other=0)
+                mask=tile_mask[:, None] & dim_mask_half[None, :],
+                other=0,
+            )
             V_lo_idx = (packed_V & 0x0F).to(tl.int32)
             V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
             V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
@@ -1373,9 +1506,57 @@ def kernel_unified_attention_3d(
             tq_vn_off = (
                 physical_block_idx * tq_norms_stride_block
                 + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
-                + kv_head_idx * tq_norms_stride_head)
-            tq_v_nrm = tl.load(
-                tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
+            V_lo = (V_lo_vals * tq_v_nrm[:, None]).to(Q.dtype)
+            V_hi = (V_hi_vals * tq_v_nrm[:, None]).to(Q.dtype)
+        elif KV_QUANT_MODE == 7:  # FP8 keys + TQ nibble values
+            # K: load FP8 bytes from cache (full dim), cast and scale
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            K_fp8_bytes = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0,
+            )
+            # Load per-token-head FP8 scale from tq_k_norms (repurposed)
+            tq_kn_off = (
+                physical_block_idx * tq_norms_stride_block
+                + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
+                + kv_head_idx * tq_norms_stride_head
+            )
+            k_fp8_scale = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
+            # Dequant: cast fp8 to float, multiply by per-token-head scale
+            K = (K_fp8_bytes.to(tl.float32) * k_fp8_scale[None, :]).to(Q.dtype)
+            k_token_head_scales = tile_mask.to(tl.float32)  # unused
+
+            # V: nibble dequant (split halves, like mode 4/6)
+            v_off_half = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d_half[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            packed_V = tl.load(
+                value_cache_ptr + v_off_half,
+                mask=tile_mask[:, None] & dim_mask_half[None, :],
+                other=0,
+            )
+            V_lo_idx = (packed_V & 0x0F).to(tl.int32)
+            V_hi_idx = ((packed_V >> 4) & 0x0F).to(tl.int32)
+            V_lo_vals = tl.load(tq_v_centroids_ptr + V_lo_idx)
+            V_hi_vals = tl.load(tq_v_centroids_ptr + V_hi_idx)
+            tq_vn_off = (
+                physical_block_idx * tq_norms_stride_block
+                + (seq_offset % BLOCK_SIZE) * tq_norms_stride_slot
+                + kv_head_idx * tq_norms_stride_head
+            )
+            tq_v_nrm = tl.load(tq_v_norms_ptr + tq_vn_off, mask=tile_mask, other=0.0)
             V_lo = (V_lo_vals * tq_v_nrm[:, None]).to(Q.dtype)
             V_hi = (V_hi_vals * tq_v_nrm[:, None]).to(Q.dtype)
         else:
@@ -1393,20 +1574,44 @@ def kernel_unified_attention_3d(
             )
             K_load = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :], other=0.0)
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
             K, k_token_head_scales = _prepare_kv_tile(
-                K_load, Q, k_scale, k_scale_cache_ptr,
-                physical_block_idx, seq_offset, kv_head_idx,
-                stride_ks_blk, stride_ks_slot, stride_ks_head,
-                tile_mask, BLOCK_SIZE, KV_QUANT_MODE)
+                K_load,
+                Q,
+                k_scale,
+                k_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_ks_blk,
+                stride_ks_slot,
+                stride_ks_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
+            )
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None], other=0.0)
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
             V, v_token_head_scales = _prepare_kv_tile(
-                V_load, Q, v_scale, v_scale_cache_ptr,
-                physical_block_idx, seq_offset, kv_head_idx,
-                stride_vs_blk, stride_vs_slot, stride_vs_head,
-                tile_mask, BLOCK_SIZE, KV_QUANT_MODE)
+                V_load,
+                Q,
+                v_scale,
+                v_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_vs_blk,
+                stride_vs_slot,
+                stride_vs_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
+            )
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
@@ -1418,16 +1623,22 @@ def kernel_unified_attention_3d(
         if USE_MM_PREFIX:
             for i in range(MAX_MM_RANGES):
                 range_start = tl.load(
-                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2)
+                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+                )
                 range_end = tl.load(
-                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1)
+                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+                )
                 is_valid = range_start < range_end
                 q_in_range = (
                     (query_abs_pos >= range_start)
-                    & (query_abs_pos <= range_end) & is_valid)
+                    & (query_abs_pos <= range_end)
+                    & is_valid
+                )
                 k_in_range = (
                     (seq_offset[None, :] >= range_start)
-                    & (seq_offset[None, :] <= range_end) & is_valid)
+                    & (seq_offset[None, :] <= range_end)
+                    & is_valid
+                )
                 seq_mask |= q_in_range & k_in_range
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -1445,14 +1656,15 @@ def kernel_unified_attention_3d(
             S = apply_softcap(S, softcap)
 
         S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
 
         if USE_ALIBI_SLOPES:
             if USE_ALIBI_SQRT:
                 relative_pos = seq_offset - (context_len + query_pos[:, None])
                 alibi_offset = tl.where(
-                    relative_pos <= 0,
-                    -tl.sqrt((-relative_pos).to(tl.float32)), 0.0)
+                    relative_pos <= 0, -tl.sqrt((-relative_pos).to(tl.float32)), 0.0
+                )
             else:
                 alibi_offset = seq_offset - context_len
             S += alibi_slope[:, None] * alibi_offset
@@ -1462,7 +1674,9 @@ def kernel_unified_attention_3d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :], other=0.0)
+                mask=is_query_key[None, :],
+                other=0.0,
+            )
             S += qq_bias
 
         m_j = tl.maximum(M, tl.max(S, axis=1))
@@ -1471,7 +1685,7 @@ def kernel_unified_attention_3d(
         l_j = tl.sum(P, axis=1)
         alpha = tl.exp(M - m_j)
 
-        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
+        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
             acc_lo = acc_lo * alpha[:, None]
             acc_hi = acc_hi * alpha[:, None]
         else:
@@ -1480,37 +1694,47 @@ def kernel_unified_attention_3d(
         L = L * alpha + l_j
         M = m_j
 
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
-                sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
-                V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
-                V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
-            else:
-                V = tl.where(
-                    (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0)
+        skip_v_accum = SPARSE_V_THRESHOLD > 0.0 and tl.max(P) < SPARSE_V_THRESHOLD
+        if not skip_v_accum:
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
+                    sw_mask = (context_len + qpos_lo - seq_offset) < SLIDING_WINDOW
+                    V_lo = tl.where(sw_mask[:, None], V_lo, 0.0)
+                    V_hi = tl.where(sw_mask[:, None], V_hi, 0.0)
+                else:
+                    V = tl.where(
+                        (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
+                        V,
+                        0.0,
+                    )
 
-        if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
-            acc_lo += tl.dot(P.to(V_lo.dtype), V_lo)
-            acc_hi += tl.dot(P.to(V_hi.dtype), V_hi)
-        elif KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
+                acc_lo += tl.dot(P.to(V_lo.dtype), V_lo)
+                acc_hi += tl.dot(P.to(V_hi.dtype), V_hi)
+            elif KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
+                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+                acc += tl.dot(P_v, V)
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # 3D epilogue: store to segment buffers.
-    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6:
+    if KV_QUANT_MODE == 4 or KV_QUANT_MODE == 6 or KV_QUANT_MODE == 7:
         segm_base = (
             query_offset_0[:, None].to(tl.int64)
             * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
             + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-            + segm_idx * HEAD_SIZE_PADDED)
+            + segm_idx * HEAD_SIZE_PADDED
+        )
         segm_mask = dim_mask_half[None, :] & q_mask_3d
-        tl.store(segm_output_ptr + segm_base + offs_d_half[None, :],
-                 acc_lo, mask=segm_mask)
-        tl.store(segm_output_ptr + segm_base + (HALF_D + offs_d_half)[None, :],
-                 acc_hi, mask=segm_mask)
+        tl.store(
+            segm_output_ptr + segm_base + offs_d_half[None, :], acc_lo, mask=segm_mask
+        )
+        tl.store(
+            segm_output_ptr + segm_base + (HALF_D + offs_d_half)[None, :],
+            acc_hi,
+            mask=segm_mask,
+        )
     else:
         segm_output_offset = (
             query_offset_0[:, None].to(tl.int64)
@@ -1690,14 +1914,16 @@ def unified_attention(
     k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     # TurboQuant params (kv_quant_mode == KVQuantMode.TURBOQUANT)
-    tq_centroids=None,      # [K_N_LEVELS] float32 (K centroids)
-    tq_v_centroids=None,    # [V_N_LEVELS] float32 (V centroids; None = same as K)
+    tq_centroids=None,  # [K_N_LEVELS] float32 (K centroids)
+    tq_v_centroids=None,  # [V_N_LEVELS] float32 (V centroids; None = same as K)
     tq_rotation_signs=None,  # [head_dim] float32
-    tq_k_norms=None,        # [num_blocks, block_size, num_kv_heads] float32
-    tq_v_norms=None,         # same
+    tq_k_norms=None,  # [num_blocks, block_size, num_kv_heads] float32
+    tq_v_norms=None,  # same
     # QJL params (Algorithm 2)
-    tq_k_res_scales=None,   # [num_blocks, block_size, num_kv_heads] float32
-    tq_v_res_scales=None,    # same
+    tq_k_res_scales=None,  # [num_blocks, block_size, num_kv_heads] float32
+    tq_v_res_scales=None,  # same
+    # Sparse V: skip V accumulation for tiles with max attn weight < threshold
+    sparse_v_threshold: float = 0.0,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1837,21 +2063,36 @@ def unified_attention(
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
             tq_centroids_ptr=tq_centroids,
-            tq_v_centroids_ptr=tq_v_centroids if tq_v_centroids is not None else tq_centroids,
+            tq_v_centroids_ptr=tq_v_centroids
+            if tq_v_centroids is not None
+            else tq_centroids,
             tq_rotation_signs_ptr=tq_rotation_signs,
             tq_k_norms_ptr=tq_k_norms,
             tq_v_norms_ptr=tq_v_norms,
             tq_norms_stride_block=tq_k_norms.stride(0) if tq_k_norms is not None else 0,
             tq_norms_stride_slot=tq_k_norms.stride(1) if tq_k_norms is not None else 0,
             tq_norms_stride_head=tq_k_norms.stride(2) if tq_k_norms is not None else 0,
-            TQ_RSQRT_HEAD_DIM=1.0 / (head_size ** 0.5) if tq_centroids is not None else 1.0,
+            TQ_RSQRT_HEAD_DIM=1.0 / (head_size**0.5)
+            if tq_centroids is not None
+            else 1.0,
             tq_k_res_scales_ptr=tq_k_res_scales,
             tq_v_res_scales_ptr=tq_v_res_scales,
-            tq_res_stride_block=tq_k_res_scales.stride(0) if tq_k_res_scales is not None else 0,
-            tq_res_stride_slot=tq_k_res_scales.stride(1) if tq_k_res_scales is not None else 0,
-            tq_res_stride_head=tq_k_res_scales.stride(2) if tq_k_res_scales is not None else 0,
+            tq_res_stride_block=tq_k_res_scales.stride(0)
+            if tq_k_res_scales is not None
+            else 0,
+            tq_res_stride_slot=tq_k_res_scales.stride(1)
+            if tq_k_res_scales is not None
+            else 0,
+            tq_res_stride_head=tq_k_res_scales.stride(2)
+            if tq_k_res_scales is not None
+            else 0,
             TQ_QJL_ENABLED=tq_k_res_scales is not None,
-            TQ_SIGN_DATA_OFFSET=((head_size // 2 + 4) if int(kv_quant_mode) == 4 else (head_size + 4)) if tq_k_res_scales is not None else 0,
+            TQ_SIGN_DATA_OFFSET=(
+                (head_size // 2 + 4) if int(kv_quant_mode) == 4 else (head_size + 4)
+            )
+            if tq_k_res_scales is not None
+            else 0,
+            SPARSE_V_THRESHOLD=sparse_v_threshold,
         )
     else:
         kernel_unified_attention_3d[
@@ -1914,21 +2155,36 @@ def unified_attention(
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
             tq_centroids_ptr=tq_centroids,
-            tq_v_centroids_ptr=tq_v_centroids if tq_v_centroids is not None else tq_centroids,
+            tq_v_centroids_ptr=tq_v_centroids
+            if tq_v_centroids is not None
+            else tq_centroids,
             tq_rotation_signs_ptr=tq_rotation_signs,
             tq_k_norms_ptr=tq_k_norms,
             tq_v_norms_ptr=tq_v_norms,
             tq_norms_stride_block=tq_k_norms.stride(0) if tq_k_norms is not None else 0,
             tq_norms_stride_slot=tq_k_norms.stride(1) if tq_k_norms is not None else 0,
             tq_norms_stride_head=tq_k_norms.stride(2) if tq_k_norms is not None else 0,
-            TQ_RSQRT_HEAD_DIM=1.0 / (head_size ** 0.5) if tq_centroids is not None else 1.0,
+            TQ_RSQRT_HEAD_DIM=1.0 / (head_size**0.5)
+            if tq_centroids is not None
+            else 1.0,
             tq_k_res_scales_ptr=tq_k_res_scales,
             tq_v_res_scales_ptr=tq_v_res_scales,
-            tq_res_stride_block=tq_k_res_scales.stride(0) if tq_k_res_scales is not None else 0,
-            tq_res_stride_slot=tq_k_res_scales.stride(1) if tq_k_res_scales is not None else 0,
-            tq_res_stride_head=tq_k_res_scales.stride(2) if tq_k_res_scales is not None else 0,
+            tq_res_stride_block=tq_k_res_scales.stride(0)
+            if tq_k_res_scales is not None
+            else 0,
+            tq_res_stride_slot=tq_k_res_scales.stride(1)
+            if tq_k_res_scales is not None
+            else 0,
+            tq_res_stride_head=tq_k_res_scales.stride(2)
+            if tq_k_res_scales is not None
+            else 0,
             TQ_QJL_ENABLED=tq_k_res_scales is not None,
-            TQ_SIGN_DATA_OFFSET=((head_size // 2 + 4) if int(kv_quant_mode) == 4 else (head_size + 4)) if tq_k_res_scales is not None else 0,
+            TQ_SIGN_DATA_OFFSET=(
+                (head_size // 2 + 4) if int(kv_quant_mode) == 4 else (head_size + 4)
+            )
+            if tq_k_res_scales is not None
+            else 0,
+            SPARSE_V_THRESHOLD=sparse_v_threshold,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

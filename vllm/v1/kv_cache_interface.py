@@ -41,18 +41,21 @@ class KVQuantMode(IntEnum):
     TURBOQUANT = 4  # TurboQuant nibble-packed (3-4 bit)
     TURBOQUANT_BYTE = 5  # TurboQuant byte storage (5-8 bit)
     TURBOQUANT_MIXED = 6  # TurboQuant byte K + nibble V
+    TURBOQUANT_FP8_KEY = 7  # FP8 keys + TurboQuant nibble values
 
     @property
     def is_per_token_head(self) -> bool:
         """True for any per-token-head quantization mode."""
-        return self in (KVQuantMode.INT8_PER_TOKEN_HEAD,
-                        KVQuantMode.FP8_PER_TOKEN_HEAD)
+        return self in (KVQuantMode.INT8_PER_TOKEN_HEAD, KVQuantMode.FP8_PER_TOKEN_HEAD)
 
     @property
     def is_turboquant(self) -> bool:
-        return self in (KVQuantMode.TURBOQUANT,
-                        KVQuantMode.TURBOQUANT_BYTE,
-                        KVQuantMode.TURBOQUANT_MIXED)
+        return self in (
+            KVQuantMode.TURBOQUANT,
+            KVQuantMode.TURBOQUANT_BYTE,
+            KVQuantMode.TURBOQUANT_MIXED,
+            KVQuantMode.TURBOQUANT_FP8_KEY,
+        )
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
@@ -65,7 +68,10 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         from vllm.v1.attention.backends.turboquant_config import (
             parse_tq_preset,
         )
+
         preset = parse_tq_preset(kv_cache_dtype)
+        if preset.k_fp8:
+            return KVQuantMode.TURBOQUANT_FP8_KEY
         k_byte = preset.k_bits > 4
         v_byte = preset.v_bits > 4
         if k_byte and not v_byte:
@@ -154,27 +160,18 @@ class AttentionSpec(KVCacheSpec):
         # raw KV cache allocation so it must be budgeted here.
         if self.kv_quant_mode.is_per_token_head:
             real_page_size += (
-                2 * self.block_size * self.num_kv_heads
-                * get_dtype_size(torch.float32)
+                2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
         return real_page_size
 
     @property
     def real_page_size_bytes(self) -> int:
         hs = self.head_size
-        # TurboQuant: nibble mode (<=4 bit) halves dim, byte mode keeps full.
+        # TurboQuant nibble mode (<=4 bit) packs 2 indices per byte,
+        # effectively halving the stored dimension.
         if self.kv_quant_mode == KVQuantMode.TURBOQUANT:
-            import vllm.envs as envs
-            bits = envs.VLLM_TURBOQUANT_BITS
-            if bits > 0 and bits <= 4:
-                hs = hs // 2
-        return (
-            2
-            * self.block_size
-            * self.num_kv_heads
-            * hs
-            * get_dtype_size(self.dtype)
-        )
+            hs = hs // 2
+        return 2 * self.block_size * self.num_kv_heads * hs * get_dtype_size(self.dtype)
 
 
 @dataclass(frozen=True, kw_only=True)
