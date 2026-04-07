@@ -302,17 +302,19 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             )
         else:
             # Standard mode: fused attention with inline dequant.
-            if self._preset.k_byte_mode != self._preset.v_byte_mode:
-                raise NotImplementedError(
-                    "Mixed byte/nibble K/V not yet supported. "
-                    f"k_bits={self._preset.k_bits}, "
-                    f"v_bits={self._preset.v_bits}. "
-                    "Both must be >4 (byte) or both <=4 (nibble)."
-                )
-
-            if self._preset.k_byte_mode:
+            k_byte = self._preset.k_byte_mode
+            v_byte = self._preset.v_byte_mode
+            if k_byte and not v_byte:
+                self._kv_quant_mode = KVQuantMode.TURBOQUANT_MIXED
+            elif k_byte:
                 self._kv_quant_mode = KVQuantMode.TURBOQUANT_BYTE
             else:
+                if not k_byte and v_byte:
+                    raise NotImplementedError(
+                        "Nibble K + byte V not supported. "
+                        f"k_bits={self._preset.k_bits}, "
+                        f"v_bits={self._preset.v_bits}."
+                    )
                 self._kv_quant_mode = KVQuantMode.TURBOQUANT
 
             from vllm.v1.attention.ops.turboquant import TurboQuantCodebook

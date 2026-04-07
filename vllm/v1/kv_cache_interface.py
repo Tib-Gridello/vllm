@@ -40,6 +40,7 @@ class KVQuantMode(IntEnum):
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     TURBOQUANT = 4  # TurboQuant nibble-packed (3-4 bit)
     TURBOQUANT_BYTE = 5  # TurboQuant byte storage (5-8 bit)
+    TURBOQUANT_MIXED = 6  # TurboQuant byte K + nibble V
 
     @property
     def is_per_token_head(self) -> bool:
@@ -50,7 +51,8 @@ class KVQuantMode(IntEnum):
     @property
     def is_turboquant(self) -> bool:
         return self in (KVQuantMode.TURBOQUANT,
-                        KVQuantMode.TURBOQUANT_BYTE)
+                        KVQuantMode.TURBOQUANT_BYTE,
+                        KVQuantMode.TURBOQUANT_MIXED)
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
@@ -64,10 +66,13 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
             parse_tq_preset,
         )
         preset = parse_tq_preset(kv_cache_dtype)
-        # Use nibble mode if both K and V are <= 4-bit
-        if preset.k_bits <= 4 and preset.v_bits <= 4:
-            return KVQuantMode.TURBOQUANT
-        return KVQuantMode.TURBOQUANT_BYTE
+        k_byte = preset.k_bits > 4
+        v_byte = preset.v_bits > 4
+        if k_byte and not v_byte:
+            return KVQuantMode.TURBOQUANT_MIXED  # byte K + nibble V
+        if k_byte:
+            return KVQuantMode.TURBOQUANT_BYTE
+        return KVQuantMode.TURBOQUANT
     if kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
