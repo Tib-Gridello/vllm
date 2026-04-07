@@ -31,6 +31,7 @@ CacheDType = Literal[
     "tq-k8v8-qjl",
     "tq-k4v4",
     "tq-k4v4-qjl",
+    "tq-k8v4",
     "tq-k4v8",
     "tq-k4v2o",
     "tq-k2v2",
