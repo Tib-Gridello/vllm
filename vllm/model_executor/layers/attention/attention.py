@@ -570,11 +570,10 @@ class Attention(nn.Module, AttentionLayerBase):
                 from vllm.v1.attention.backends.turboquant_config import (
                     parse_tq_preset,
                 )
+
                 preset = parse_tq_preset(self.kv_cache_dtype)
                 padded_dim = preset.padded_cache_dim(self.head_size)
-                tq_padded = (
-                    2 * block_size * self.num_kv_heads * padded_dim
-                )
+                tq_padded = 2 * block_size * self.num_kv_heads * padded_dim
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

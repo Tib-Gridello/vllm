@@ -320,6 +320,12 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
                 qjl=self._preset.qjl,
             )
 
+            # FP8 E4M3 decode LUT: 256 float values for all possible bytes.
+            # Used by the Triton kernel as a gather-based FP8 decoder that
+            # works on all GPU architectures (A100, H100, B100).
+            fp8_bytes = torch.arange(256, dtype=torch.uint8)
+            self._fp8_lut = fp8_bytes.view(torch.float8_e4m3fn).float()
+
             logger.info(
                 "TurboQuant backend: preset=%s, k=FP8, v_bits=%d, "
                 "qjl=%s, head_dim=%d, padded_dim=%d, fused=True",
@@ -711,7 +717,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
                 k_descale=None,
                 v_descale=None,
                 kv_quant_mode=self._kv_quant_mode,
-                tq_centroids=None,  # No K codebook
+                tq_centroids=self._fp8_lut.to(dev),  # FP8 decode LUT (256 floats)
                 tq_v_centroids=v_cb.centroids,
                 tq_k_norms=self._k_scales,  # FP8 per-token-head scales
                 tq_v_norms=self._v_norms,

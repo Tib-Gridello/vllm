@@ -692,8 +692,9 @@ def kernel_unified_attention_2d(
                 + kv_head_idx * tq_norms_stride_head
             )
             k_fp8_scale = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
-            # Dequant: cast fp8 to float, multiply by per-token-head scale
-            K = (K_fp8_bytes.to(tl.float32) * k_fp8_scale[None, :]).to(Q.dtype)
+            # Dequant: LUT decode (works on all architectures)
+            K_float = tl.load(tq_centroids_ptr + K_fp8_bytes.to(tl.int32))
+            K = (K_float * k_fp8_scale[None, :]).to(Q.dtype)
             k_token_head_scales = tile_mask.to(tl.float32)  # unused
 
             # V: nibble dequant (split halves, like mode 4/6)
@@ -1531,8 +1532,9 @@ def kernel_unified_attention_3d(
                 + kv_head_idx * tq_norms_stride_head
             )
             k_fp8_scale = tl.load(tq_k_norms_ptr + tq_kn_off, mask=tile_mask, other=0.0)
-            # Dequant: cast fp8 to float, multiply by per-token-head scale
-            K = (K_fp8_bytes.to(tl.float32) * k_fp8_scale[None, :]).to(Q.dtype)
+            # Dequant: LUT decode (works on all architectures)
+            K_float = tl.load(tq_centroids_ptr + K_fp8_bytes.to(tl.int32))
+            K = (K_float * k_fp8_scale[None, :]).to(Q.dtype)
             k_token_head_scales = tile_mask.to(tl.float32)  # unused
 
             # V: nibble dequant (split halves, like mode 4/6)

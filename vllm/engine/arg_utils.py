@@ -1594,9 +1594,7 @@ class EngineArgs:
         if not skip_layers:
             boundary = envs.VLLM_TURBOQUANT_BOUNDARY_LAYERS
             if boundary > 0 and resolved_cache_dtype.startswith("tq-"):
-                n_layers = getattr(
-                    model_config.hf_config, "num_hidden_layers", 0
-                )
+                n_layers = getattr(model_config.hf_config, "num_hidden_layers", 0)
                 if n_layers > 0:
                     for i in range(boundary):
                         skip_layers.append(str(i))
@@ -1605,7 +1603,8 @@ class EngineArgs:
                     logger.info(
                         "TurboQuant: auto-skipping boundary layers %s "
                         "(VLLM_TURBOQUANT_BOUNDARY_LAYERS=%d)",
-                        skip_layers, boundary,
+                        skip_layers,
+                        boundary,
                     )
 
         cache_config = CacheConfig(

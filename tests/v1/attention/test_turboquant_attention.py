@@ -67,6 +67,8 @@ def _sdpa_reference(
     num_q_heads = query.shape[1]
     num_kv_heads = key.shape[1]
     num_queries_per_kv = num_q_heads // num_kv_heads
+    num_q_tokens = query.shape[0]
+    seq_len = key.shape[0]
 
     if num_queries_per_kv > 1:
         key = key.repeat_interleave(num_queries_per_kv, dim=1)
@@ -77,14 +79,37 @@ def _sdpa_reference(
     k = key.unsqueeze(0).transpose(1, 2)  # (1, H, T_k, D)
     v = value.unsqueeze(0).transpose(1, 2)  # (1, H, T_k, D)
 
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        is_causal=True,
-        scale=scale,
-    )
+    if num_q_tokens == seq_len:
+        # Prefill: Q and K same length, is_causal=True works directly
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            scale=scale,
+        )
+    else:
+        # Decode: Q tokens are at the END of the sequence.
+        # is_causal=True assumes Q starts at position 0, which is wrong.
+        # Build explicit causal mask: q_pos[i] >= k_pos[j]
+        context_len = seq_len - num_q_tokens
+        q_pos = torch.arange(
+            context_len,
+            seq_len,
+            device=query.device,
+        )
+        k_pos = torch.arange(seq_len, device=query.device)
+        # (T_q, T_k) bool mask: True = attend, False = mask out
+        mask = q_pos[:, None] >= k_pos[None, :]
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            is_causal=False,
+            scale=scale,
+        )
     return out.transpose(1, 2).squeeze(0)  # (T_q, H, D)
 
 
