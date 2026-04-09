@@ -215,3 +215,47 @@ class TestKVQuantMode:
 
         mode = get_kv_quant_mode("turboquant")
         assert mode.is_turboquant
+
+
+class TestBoundarySkipLayers:
+    """Test auto-computed boundary layer protection."""
+
+    def test_8bit_no_skip(self):
+        from vllm.v1.attention.backends.turboquant_config import (
+            get_boundary_skip_layers,
+        )
+
+        assert get_boundary_skip_layers(28, "tq_k8v8") == []
+
+    def test_mixed_skip_first_last(self):
+        from vllm.v1.attention.backends.turboquant_config import (
+            get_boundary_skip_layers,
+        )
+
+        result = get_boundary_skip_layers(28, "tq_k8fv4")
+        assert result == ["0", "27"]
+
+    def test_4bit_skip_two_each(self):
+        from vllm.v1.attention.backends.turboquant_config import (
+            get_boundary_skip_layers,
+        )
+
+        result = get_boundary_skip_layers(28, "tq_k4v4")
+        assert result == ["0", "1", "26", "27"]
+
+    def test_small_model(self):
+        from vllm.v1.attention.backends.turboquant_config import (
+            get_boundary_skip_layers,
+        )
+
+        # 4-layer model: first 2 + last 2 overlap
+        result = get_boundary_skip_layers(4, "tq_k4v4")
+        assert result == ["0", "1", "2", "3"]
+
+    def test_32_layer_model(self):
+        from vllm.v1.attention.backends.turboquant_config import (
+            get_boundary_skip_layers,
+        )
+
+        result = get_boundary_skip_layers(32, "tq_k4v4")
+        assert result == ["0", "1", "30", "31"]

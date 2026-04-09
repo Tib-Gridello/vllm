@@ -154,3 +154,26 @@ def is_tq_preset(kv_cache_dtype: str) -> bool:
     """Return True if kv_cache_dtype is a tq_* preset or 'turboquant' alias."""
     kv_cache_dtype = _TQ_ALIASES.get(kv_cache_dtype, kv_cache_dtype)
     return bool(_TQ_PATTERN.match(kv_cache_dtype))
+
+
+def get_boundary_skip_layers(num_layers: int, preset_name: str) -> list[str]:
+    """Auto-compute boundary layers to skip for quality protection.
+
+    First/last layers carry disproportionate semantic weight and are
+    most sensitive to KV cache quantization error. Keeping them in bf16
+    breaks the error accumulation chain for autoregressive generation.
+
+    Heuristic (empirically validated on Qwen2.5-7B, Llama-3-8B):
+      - 8-bit (avg > 6): near-lossless, no skip needed
+      - Mixed (avg 4-6): protect first + last layer
+      - 4-bit (avg <= 4): protect first 2 + last 2 layers
+    """
+    preset = parse_tq_preset(preset_name)
+    avg_bits = preset.avg_bits_per_dim
+    if avg_bits > 6:
+        return []
+    if avg_bits > 4:
+        return [str(0), str(num_layers - 1)]
+    # 4-bit and below: first 2 + last 2
+    skip = {0, 1, num_layers - 2, num_layers - 1}
+    return sorted([str(x) for x in skip if 0 <= x < num_layers], key=int)

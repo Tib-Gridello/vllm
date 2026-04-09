@@ -1589,6 +1589,30 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        # Auto-compute boundary skip layers for TurboQuant low-bit
+        # presets if the user did not specify them manually.
+        if (
+            resolved_cache_dtype is not None
+            and (
+                resolved_cache_dtype.startswith("tq_")
+                or resolved_cache_dtype == "turboquant"
+            )
+            and not self.kv_cache_dtype_skip_layers
+        ):
+            from vllm.v1.attention.backends.turboquant_config import (
+                get_boundary_skip_layers,
+            )
+
+            num_layers = model_config.get_total_num_hidden_layers()
+            auto_skip = get_boundary_skip_layers(num_layers, resolved_cache_dtype)
+            if auto_skip:
+                self.kv_cache_dtype_skip_layers = auto_skip
+                logger.info(
+                    "TurboQuant: auto-protecting boundary layers %s "
+                    "(override with --kv-cache-dtype-skip-layers)",
+                    auto_skip,
+                )
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
