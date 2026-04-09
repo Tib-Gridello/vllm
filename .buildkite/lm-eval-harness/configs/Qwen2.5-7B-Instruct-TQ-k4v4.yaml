@@ -1,0 +1,14 @@
+# TurboQuant 4-bit KV cache compression (4x capacity).
+# Auto boundary layers protect first 2 + last 2 layers in bf16.
+# bash .buildkite/lm-eval-harness/run-lm-eval-gsm-vllm-baseline.sh -m Qwen/Qwen2.5-7B-Instruct -b 32 -l 250 -f 5 -t 1 --kv-cache-dtype tq_k4v4
+model_name: "Qwen/Qwen2.5-7B-Instruct"
+tasks:
+- name: "gsm8k"
+  metrics:
+  - name: "exact_match,strict-match"
+    value: 0.790
+  - name: "exact_match,flexible-extract"
+    value: 0.827
+limit: 1000
+num_fewshot: 5
+extra_args: "--kv-cache-dtype tq_k4v4"

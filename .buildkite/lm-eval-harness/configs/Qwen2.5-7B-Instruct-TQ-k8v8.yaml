@@ -1,0 +1,13 @@
+# TurboQuant 8-bit KV cache compression (2x capacity, near-lossless).
+# bash .buildkite/lm-eval-harness/run-lm-eval-gsm-vllm-baseline.sh -m Qwen/Qwen2.5-7B-Instruct -b 32 -l 250 -f 5 -t 1 --kv-cache-dtype tq_k8v8
+model_name: "Qwen/Qwen2.5-7B-Instruct"
+tasks:
+- name: "gsm8k"
+  metrics:
+  - name: "exact_match,strict-match"
+    value: 0.803
+  - name: "exact_match,flexible-extract"
+    value: 0.832
+limit: 1000
+num_fewshot: 5
+extra_args: "--kv-cache-dtype tq_k8v8"
