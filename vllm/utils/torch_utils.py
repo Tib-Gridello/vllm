@@ -351,7 +351,10 @@ def resolve_kv_cache_dtype_string(
     Returns the resolved cache_dtype string.
     """
     if kv_cache_dtype != "auto":
-        return kv_cache_dtype
+        # Resolve TQ backward-compat aliases (tq-k8v8 → tq_k8v8)
+        from vllm.v1.attention.backends.turboquant_config import _TQ_ALIASES
+
+        return _TQ_ALIASES.get(kv_cache_dtype, kv_cache_dtype)
 
     hf_cfg = getattr(model_config, "hf_config", None)
     if hf_cfg is not None:
