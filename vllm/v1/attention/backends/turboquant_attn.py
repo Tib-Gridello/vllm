@@ -840,11 +840,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             )
 
             # Inverse-rotate output (V was in rotated space)
-            v_signs = getattr(v_cb, "rotation_signs", None)
+            v_R = v_cb.rotation_matrix
             out_slice = output[:num_actual_tokens]
-            out_slice.copy_(
-                inverse_rotate_output(out_slice, v_cb.rotation_matrix, v_signs)
-            )
+            out_slice.copy_(inverse_rotate_output(out_slice, v_R))
 
             return output
 
@@ -857,10 +855,8 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._v_codebook.to(dev)
         k_cb = self._k_codebook
         v_cb = self._v_codebook
-
-        # Use O(d log d) FWHT when signs are available, else O(d²) matmul.
-        k_signs = getattr(k_cb, "rotation_signs", None)
-        q_rot = rotate_query(query[:num_actual_tokens], k_cb.rotation_matrix_T, k_signs)
+        k_R_T = k_cb.rotation_matrix_T
+        q_rot = rotate_query(query[:num_actual_tokens], k_R_T)
 
         unified_attention(
             q=q_rot,
@@ -897,9 +893,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         )
 
         # Inverse-rotate output (V was in rotated space)
-        v_signs = getattr(v_cb, "rotation_signs", None)
+        v_R = v_cb.rotation_matrix
         out_slice = output[:num_actual_tokens]
-        out_slice.copy_(inverse_rotate_output(out_slice, v_cb.rotation_matrix, v_signs))
+        out_slice.copy_(inverse_rotate_output(out_slice, v_R))
 
         return output
 
