@@ -1,0 +1,5 @@
+model_name: "Qwen/Qwen2.5-7B-Instruct"
+accuracy_threshold: 0.80
+num_questions: 1319
+num_fewshot: 5
+server_args: "--enforce-eager --max-model-len 8192 --kv-cache-dtype tq-k4v4 --kv-cache-dtype-skip-layers 0 1 26 27"
