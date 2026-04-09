@@ -22,7 +22,7 @@ class TestPresetParsing:
         assert not p.qjl
 
     def test_qjl_flag(self):
-        p = parse_tq_preset("tq_k4v4-qjl")
+        p = parse_tq_preset("tq_k4v4_qjl")
         assert p.k_bits == 4
         assert p.v_bits == 4
         assert p.qjl
@@ -52,7 +52,7 @@ class TestPresetParsing:
 
     def test_is_tq_preset(self):
         assert is_tq_preset("tq_k8v8")
-        assert is_tq_preset("tq_k4v4-qjl")
+        assert is_tq_preset("tq_k4v4_qjl")
         assert is_tq_preset("turboquant")  # alias
         assert not is_tq_preset("fp8")
         assert not is_tq_preset("auto")
@@ -93,13 +93,13 @@ class TestPresetProperties:
         assert p.cache_dim_per_head(128, "k") == 68
 
     def test_cache_dim_byte_qjl(self):
-        p = parse_tq_preset("tq_k8v8-qjl")
+        p = parse_tq_preset("tq_k8v8_qjl")
         # qjl_padded_dim(128) = 128 + 4 + 16 + 4 = 152
         dim = p.cache_dim_per_head(128, "k")
         assert dim == 152
 
     def test_padded_cache_dim_aligned(self):
-        p = parse_tq_preset("tq_k8v8-qjl")
+        p = parse_tq_preset("tq_k8v8_qjl")
         padded = p.padded_cache_dim(128)
         # 152 → aligned to 16 = 160
         assert padded == 160
@@ -124,7 +124,7 @@ class TestBackendClass:
             TurboQuantAttentionBackend,
         )
 
-        assert TurboQuantAttentionBackend.supports_kv_cache_dtype("tq_k8v8-qjl")
+        assert TurboQuantAttentionBackend.supports_kv_cache_dtype("tq_k8v8_qjl")
         assert TurboQuantAttentionBackend.supports_kv_cache_dtype("tq_k4v4")
         assert TurboQuantAttentionBackend.supports_kv_cache_dtype("turboquant")
         assert not TurboQuantAttentionBackend.supports_kv_cache_dtype("fp8")
@@ -151,7 +151,7 @@ class TestBackendClass:
             block_size=16,
             num_kv_heads=4,
             head_size=128,
-            cache_dtype_str="tq_k8v8-qjl",
+            cache_dtype_str="tq_k8v8_qjl",
         )
         assert shape[0] == 100  # num_blocks
         assert shape[1] == 2  # K/V split

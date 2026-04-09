@@ -113,6 +113,8 @@ _TQ_ALIASES = {
     "tq-k8v8": "tq_k8v8",
     "tq-k8fv4": "tq_k8fv4",
     "tq-k4v4": "tq_k4v4",
+    "tq-k8v8-qjl": "tq_k8v8_qjl",
+    "tq-k4v4-qjl": "tq_k4v4_qjl",
 }
 
 
