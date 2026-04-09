@@ -39,6 +39,7 @@ _THRESHOLD = {
     "tq_k8v8": 0.98,
     "tq_k8fv4": 0.99,
     "tq_k4v4": 0.90,
+    "tq_k3v4": 0.85,
 }
 
 
@@ -302,7 +303,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Basic decode correctness --
 
-    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k8fv4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k8fv4", "tq_k3v4"])
     @pytest.mark.parametrize("num_tokens", [1, 4, 16])
     @pytest.mark.parametrize("seq_len", [32, 128, 512])
     def test_decode_correctness(self, preset: str, num_tokens: int, seq_len: int):
@@ -326,7 +327,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- GQA --
 
-    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k3v4"])
     def test_gqa(self, preset: str):
         """GQA: num_q_heads=32, num_kv_heads=8 (4x ratio)."""
         cos_sim = _run_tq_attention_test(
@@ -402,7 +403,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Numerical stability --
 
-    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k3v4"])
     def test_numerical_stability_large_norms(self, preset: str):
         """Test with large-norm vectors (scaled up by 100x).
 
@@ -465,6 +466,7 @@ class TestTurboQuantAttentionCorrectness:
             "tq_k8v8": 0.95,
             "tq_k8fv4": 0.95,
             "tq_k4v4": 0.70,
+            "tq_k3v4": 0.60,
         }
         threshold = large_norm_threshold[preset]
         assert cos_sim > threshold, (
@@ -472,7 +474,7 @@ class TestTurboQuantAttentionCorrectness:
             f"threshold {threshold} for preset={preset}"
         )
 
-    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k3v4"])
     def test_numerical_stability_small_norms(self, preset: str):
         """Test with near-zero vectors (scaled down by 1e-3).
 
@@ -561,7 +563,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Prefill-only (all tokens are new, no context) --
 
-    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k3v4"])
     def test_prefill_only(self, preset: str):
         """Prefill-only: context_len=0, all tokens are new.
 

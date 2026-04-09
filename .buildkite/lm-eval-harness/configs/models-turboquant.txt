@@ -1,2 +1,3 @@
 Qwen2.5-7B-Instruct-TQ-k8v8.yaml
 Qwen2.5-7B-Instruct-TQ-k4v4.yaml
+Qwen2.5-7B-Instruct-TQ-k3v4.yaml

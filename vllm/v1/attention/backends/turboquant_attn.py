@@ -309,7 +309,11 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # Hadamard requires power-of-2 head_dim
+        # Triton encode/dequant kernels use tl.arange(0, HEAD_DIM) which
+        # requires HEAD_DIM to be a power of 2. The block-diagonal
+        # Hadamard rotation in generate_rotation_matrix() already
+        # supports arbitrary sizes — this gate can be relaxed once the
+        # Triton kernels adopt padded dims + masks.
         return head_size >= 32 and (head_size & (head_size - 1)) == 0
 
     @classmethod
@@ -386,7 +390,9 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             )
         if head_size < 32 or (head_size & (head_size - 1)) != 0:
             raise ValueError(
-                f"TurboQuant requires power-of-2 head_size >= 32, got {head_size}"
+                f"TurboQuant requires power-of-2 head_size >= 32, got "
+                f"{head_size}. Non-power-of-2 support requires padded "
+                f"Triton kernels (see supports_head_size docstring)."
             )
 
         if sliding_window is not None:

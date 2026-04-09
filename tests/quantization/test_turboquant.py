@@ -1632,10 +1632,10 @@ class TestGPUKernelRoundtrip:
 
     These tests verify that the Triton kernels produce outputs that match
     the Python reference implementation and that encode→decode roundtrips
-    preserve vector quality.  PR #38479 has zero GPU kernel tests.
+    preserve vector quality.
     """
 
-    @pytest.mark.parametrize("n_bits", [4, 6, 8])
+    @pytest.mark.parametrize("n_bits", [3, 4, 6, 8])
     @pytest.mark.parametrize("head_dim", [64, 128])
     def test_encode_roundtrip_quality(self, n_bits: int, head_dim: int):
         """Triton encode → Triton dequant → cosine similarity with original.
@@ -1734,7 +1734,7 @@ class TestGPUKernelRoundtrip:
                         f"seq={s}, pos={i}, head={h})"
                     )
 
-    @pytest.mark.parametrize("n_bits", [4, 8])
+    @pytest.mark.parametrize("n_bits", [3, 4, 8])
     def test_triton_vs_reference_encode(self, n_bits: int):
         """Triton encode indices match Python reference indices exactly.
 

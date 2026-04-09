@@ -16,6 +16,8 @@ Recommended presets:
   tq_k8v8      = 8-bit MSE-only (best quality, 2x compression, default)
   tq_k8fv4     = FP8 keys + 4-bit TQ values (best quality/compression ratio)
   tq_k4v4      = 4-bit MSE-only (4x compression)
+  tq_k3v4      = 3-bit keys + 4-bit values (4.3x compression)
+  tq_k2v4      = 2-bit keys + 4-bit values (5.3x compression, aggressive)
 
 QJL (_qjl suffix) adds 1-bit residual sign correction. The paper uses
 Algorithm 1 (MSE-only) for KV cache, not Algorithm 2 (QJL). Community
@@ -92,12 +94,17 @@ class TQPreset:
         Uses max(k_dim, v_dim) so both K and V halves of the cache
         tensor have the same last dimension (required by standard
         paged KV cache shape with leading-2 dim).
+
+        Aligned to 4 bytes (float32 norm alignment). All raw dimensions
+        are already 4-byte aligned by construction (idx_bytes is always
+        a multiple of 4, plus 4 bytes for the float32 norm), so this
+        is a no-op in practice but guards against future layout changes.
         """
         k_dim = self.cache_dim_per_head(head_dim, "k")
         v_dim = self.cache_dim_per_head(head_dim, "v")
         raw = max(k_dim, v_dim)
-        # Align to 16 bytes for memory access efficiency
-        return (raw + 15) & ~15
+        # Align to 4 bytes for float32 norm access.
+        return (raw + 3) & ~3
 
 
 # Regex for parsing preset strings
@@ -113,6 +120,8 @@ _TQ_ALIASES = {
     "tq-k8v8": "tq_k8v8",
     "tq-k8fv4": "tq_k8fv4",
     "tq-k4v4": "tq_k4v4",
+    "tq-k3v4": "tq_k3v4",
+    "tq-k2v4": "tq_k2v4",
     "tq-k8v8-qjl": "tq_k8v8_qjl",
     "tq-k4v4-qjl": "tq_k4v4_qjl",
 }

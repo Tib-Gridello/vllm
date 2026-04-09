@@ -101,9 +101,9 @@ class TestPresetProperties:
     def test_padded_cache_dim_aligned(self):
         p = parse_tq_preset("tq_k8v8_qjl")
         padded = p.padded_cache_dim(128)
-        # 152 → aligned to 16 = 160
-        assert padded == 160
-        assert padded % 16 == 0
+        # 152 → aligned to 4 = 152 (already 4-byte aligned)
+        assert padded == 152
+        assert padded % 4 == 0
 
 
 # ============================================================================
@@ -157,7 +157,7 @@ class TestBackendClass:
         assert shape[1] == 2  # K/V split
         assert shape[2] == 16  # block_size
         assert shape[3] == 4  # num_kv_heads
-        assert shape[4] == 160  # padded_dim (152 → aligned to 160)
+        assert shape[4] == 152  # padded_dim (152, already 4-byte aligned)
 
     def test_forward_excludes_kv_update(self):
         from vllm.v1.attention.backends.turboquant_attn import (
@@ -259,3 +259,111 @@ class TestBoundarySkipLayers:
 
         result = get_boundary_skip_layers(32, "tq_k4v4")
         assert result == ["0", "1", "30", "31"]
+
+    def test_3bit_key_skip(self):
+        """3-bit keys + 4-bit values: avg 3.5 bits ≤ 4 → skip first 2 + last 2."""
+        from vllm.v1.attention.backends.turboquant_config import (
+            get_boundary_skip_layers,
+        )
+
+        result = get_boundary_skip_layers(28, "tq_k3v4")
+        assert result == ["0", "1", "26", "27"]
+
+
+# ============================================================================
+# 3-bit Preset Tests
+# ============================================================================
+
+
+class TestThreeBitPreset:
+    """Tests for tq_k3v4 and other 3-bit configurations."""
+
+    def test_parse_k3v4(self):
+        p = parse_tq_preset("tq_k3v4")
+        assert p.k_bits == 3
+        assert p.v_bits == 4
+        assert not p.qjl
+        assert not p.k_fp8
+
+    def test_parse_k3v3(self):
+        p = parse_tq_preset("tq_k3v3")
+        assert p.k_bits == 3
+        assert p.v_bits == 3
+
+    def test_3bit_nibble_mode(self):
+        """3-bit keys use nibble mode (≤4 bit)."""
+        p = parse_tq_preset("tq_k3v4")
+        assert not p.k_byte_mode
+        assert not p.v_byte_mode
+
+    def test_3bit_avg_bits(self):
+        p = parse_tq_preset("tq_k3v4")
+        assert p.avg_bits_per_dim == 3.5
+
+    def test_3bit_cache_dim(self):
+        """3-bit still uses nibble packing (4-bit containers)."""
+        p = parse_tq_preset("tq_k3v4")
+        # Nibble mode: head_dim // 2 + 4 bytes norm = 64 + 4 = 68
+        assert p.cache_dim_per_head(128, "k") == 68
+
+    def test_3bit_kv_quant_mode(self):
+        from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
+
+        mode = get_kv_quant_mode("tq_k3v4")
+        assert mode == KVQuantMode.TURBOQUANT
+
+    def test_backward_compat_hyphen(self):
+        p = parse_tq_preset("tq-k3v4")
+        assert p.k_bits == 3
+        assert p.v_bits == 4
+
+
+# ============================================================================
+# CacheDType Validation Tests
+# ============================================================================
+
+
+class TestCacheDTypeValidation:
+    """Tests for dynamic TQ preset validation in CacheConfig."""
+
+    def test_known_static_dtypes(self):
+        """Static dtypes should be accepted."""
+        from vllm.config.cache import CacheConfig
+
+        for dtype in ["auto", "fp8", "bfloat16"]:
+            cfg = CacheConfig(cache_dtype=dtype)
+            assert cfg.cache_dtype == dtype
+
+    def test_tq_preset_accepted(self):
+        """All valid tq_* presets should be accepted."""
+        from vllm.config.cache import CacheConfig
+
+        for dtype in [
+            "tq_k8v8",
+            "tq_k4v4",
+            "tq_k8fv4",
+            "tq_k3v4",
+            "tq_k8v8_qjl",
+            "tq_k4v4_qjl",
+            "turboquant",
+        ]:
+            cfg = CacheConfig(cache_dtype=dtype)
+            assert cfg.cache_dtype == dtype
+
+    def test_invalid_dtype_rejected(self):
+        """Unknown dtypes should raise ValueError."""
+        from pydantic import ValidationError
+
+        from vllm.config.cache import CacheConfig
+
+        with pytest.raises((ValueError, ValidationError)):
+            CacheConfig(cache_dtype="not_a_dtype")
+
+    def test_invalid_tq_format_rejected(self):
+        """Malformed tq_ strings should raise ValueError."""
+        from pydantic import ValidationError
+
+        from vllm.config.cache import CacheConfig
+
+        with pytest.raises((ValueError, ValidationError)):
+            CacheConfig(cache_dtype="tq_invalid")

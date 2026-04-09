@@ -651,6 +651,12 @@ def turboquant_reshape_and_cache(
 ) -> None:
     """Encode K/V with TurboQuant and scatter into paged cache.
 
+    .. note:: **Test-only helper.** Uses a single shared codebook for both
+       K and V, which is only valid for symmetric presets (e.g. ``tq_k8v8``,
+       ``tq_k4v4``).  Production code uses :func:`turboquant_encode_single`
+       (called per-tensor from ``do_kv_cache_update``) to support asymmetric
+       presets like ``tq_k8fv4``.
+
     Paper algorithm:
       1. norm = ||x||
       2. x_hat = x / norm (unit vector)

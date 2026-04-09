@@ -1617,7 +1617,7 @@ class EngineArgs:
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
-            cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
+            cache_dtype=resolved_cache_dtype,
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,

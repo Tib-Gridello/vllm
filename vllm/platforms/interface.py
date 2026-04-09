@@ -525,7 +525,21 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
+        # Compute attention page size for 1 token.
+        # TurboQuant presets need page_size_padded to account for
+        # norms, sign bits, and alignment padding stored per head.
+        tq_padded_1tok: int | None = None
+        cache_dtype_str = cache_config.cache_dtype
+        if cache_dtype_str.startswith("tq_") or cache_dtype_str == "turboquant":
+            from vllm.v1.attention.backends.turboquant_config import (
+                parse_tq_preset,
+            )
+
+            preset = parse_tq_preset(cache_dtype_str)
+            num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+            padded_dim = preset.padded_cache_dim(model_config.get_head_size())
+            tq_padded_1tok = 2 * 1 * num_kv_heads * padded_dim
+
         if model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
@@ -541,6 +555,7 @@ class Platform:
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                page_size_padded=tq_padded_1tok,
             ).page_size_bytes
 
         # Compute mamba page size

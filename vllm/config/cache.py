@@ -15,22 +15,11 @@ from vllm.utils.torch_utils import (
 
 logger = init_logger(__name__)
 
-CacheDType = Literal[
-    "auto",
-    "float16",
-    "bfloat16",
-    "fp8",
-    "fp8_e4m3",
-    "fp8_e5m2",
-    "fp8_inc",
-    "fp8_ds_mla",
-    "int8_per_token_head",
-    "fp8_per_token_head",
-    "turboquant",
-    "tq_k8v8",
-    "tq_k8fv4",
-    "tq_k4v4",
-]
+# All known cache dtype strings.  TurboQuant presets use the dynamic
+# pattern ``tq_k{K}[f]v{V}[_qjl]`` (K,V ∈ 2-8), so the type is str
+# rather than a closed Literal — runtime validation happens in
+# ``_validate_cache_dtype`` below.
+CacheDType = str
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
@@ -243,9 +232,43 @@ class CacheConfig:
             )
         return calculate_kv_scales
 
+    _KNOWN_CACHE_DTYPES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "auto",
+            "float16",
+            "bfloat16",
+            "fp8",
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "fp8_inc",
+            "fp8_ds_mla",
+            "int8_per_token_head",
+            "fp8_per_token_head",
+            "turboquant",
+        }
+    )
+
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+        # Validate known static dtypes and dynamic TQ preset patterns.
+        if cache_dtype not in cls._KNOWN_CACHE_DTYPES and not cache_dtype.startswith(
+            "tq_"
+        ):
+            raise ValueError(
+                f"Unknown cache_dtype: '{cache_dtype}'. "
+                f"Expected one of {sorted(cls._KNOWN_CACHE_DTYPES)} "
+                f"or a TurboQuant preset (tq_k{{K}}[f]v{{V}}[_qjl])."
+            )
+
+        # Validate TQ preset format early so users get clear errors.
+        if cache_dtype.startswith("tq_") or cache_dtype == "turboquant":
+            from vllm.v1.attention.backends.turboquant_config import (
+                parse_tq_preset,
+            )
+
+            parse_tq_preset(cache_dtype)  # raises ValueError on bad format
+
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
