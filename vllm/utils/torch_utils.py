@@ -37,8 +37,17 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
     "int8": torch.int8,
+    "int8_per_token_head": torch.int8,
+    "fp8_per_token_head": torch.uint8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
+    "turboquant": torch.uint8,
+    # TurboQuant named presets (all stored as uint8).
+    # Common presets listed here; dynamic tq-* presets are handled
+    # by get_kv_cache_torch_dtype() below.
+    "tq-k8v8": torch.uint8,
+    "tq-k8fv4": torch.uint8,
+    "tq-k4v4": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -62,7 +71,16 @@ T = TypeVar("T")
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return kv_cache_dtype.startswith("fp8")
+    return kv_cache_dtype.startswith("fp8") or kv_cache_dtype.endswith("per_token_head")
+
+
+def is_turboquant_kv_cache(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq-")
+
+
+def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
+    """Return True if *kv_cache_dtype* needs per-token-head scales."""
+    return kv_cache_dtype.endswith("per_token_head")
 
 
 def is_strictly_contiguous(t: torch.Tensor) -> bool:
@@ -252,6 +270,9 @@ def get_kv_cache_torch_dtype(
                 raise ValueError(f"Invalid model dtype: {model_dtype}")
         elif cache_dtype in STR_DTYPE_TO_TORCH_DTYPE:
             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        elif cache_dtype.startswith("tq-") or cache_dtype == "turboquant":
+            # All TurboQuant presets use uint8 storage
+            torch_dtype = torch.uint8
         else:
             raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
     elif isinstance(cache_dtype, torch.dtype):

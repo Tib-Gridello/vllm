@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    get_kv_quant_mode,
 )
 
 if TYPE_CHECKING:
@@ -381,8 +382,10 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # for attn backends supporting query quantization
         self.query_quant = None
-        if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith(
-            "fp8"
+        if (
+            self.impl.supports_quant_query_input
+            and self.kv_cache_dtype.startswith("fp8")
+            and not self.kv_cache_dtype.endswith("per_token_head")
         ):
             is_per_head = (
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
@@ -539,6 +542,7 @@ class Attention(nn.Module, AttentionLayerBase):
         block_size = vllm_config.cache_config.block_size
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
+        quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
@@ -548,15 +552,36 @@ class Attention(nn.Module, AttentionLayerBase):
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             )
         else:
+            # TurboQuant presets: padded cache dim > model head_size.
+            # Tell the allocator the true page size via page_size_padded.
+            tq_padded: int | None = None
+            if (
+                hasattr(self, "kv_cache_dtype")
+                and isinstance(self.kv_cache_dtype, str)
+                and (
+                    self.kv_cache_dtype.startswith("tq-")
+                    or self.kv_cache_dtype == "turboquant"
+                )
+            ):
+                from vllm.v1.attention.backends.turboquant_config import (
+                    parse_tq_preset,
+                )
+
+                preset = parse_tq_preset(self.kv_cache_dtype)
+                padded_dim = preset.padded_cache_dim(self.head_size)
+                tq_padded = 2 * block_size * self.num_kv_heads * padded_dim
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
+                page_size_padded=tq_padded,
             )
 
 
