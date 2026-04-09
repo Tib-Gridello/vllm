@@ -654,6 +654,82 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         self._v_res_scales = None
         self._k_scales = None
 
+    # ----- Flash-attn prefill (first-chunk only) -----
+
+    def _flash_attn_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use flash_attn for first-chunk prefill (K/V still in bf16).
+
+        During first-chunk prefill, max_query_len == max_seq_len — all
+        tokens are new, no prior KV cache context. K and V haven't been
+        encoded to TQ yet, so we can use flash_attn directly on the raw
+        bf16 tensors. This is both faster (CUDA kernel) and lossless
+        (no quantization noise on the prefill step).
+        """
+        from vllm.v1.attention.backends.fa_utils import (
+            is_flash_attn_varlen_func_available,
+        )
+
+        if not is_flash_attn_varlen_func_available():
+            # Fall back to SDPA if flash_attn not available
+            return self._sdpa_prefill(query, key, value, attn_metadata, output)
+
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+        )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        flash_attn_varlen_func(
+            q=query[:num_actual_tokens],
+            k=key[:num_actual_tokens],
+            v=value[:num_actual_tokens],
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            cu_seqlens_k=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=self.sliding_window,
+            softcap=self.logits_soft_cap,
+        )
+        return output
+
+    def _sdpa_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fallback SDPA prefill when flash_attn is unavailable."""
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        q = query[:num_actual_tokens]
+        k = key[:num_actual_tokens]
+        v = value[:num_actual_tokens]
+
+        # Simple per-request SDPA (no paging needed for first-chunk)
+        query_start_loc = attn_metadata.query_start_loc
+        num_reqs = len(attn_metadata.seq_lens)
+        for i in range(num_reqs):
+            start = query_start_loc[i].item()
+            end = query_start_loc[i + 1].item()
+            qi = q[start:end].unsqueeze(0).transpose(1, 2)
+            ki = k[start:end].unsqueeze(0).transpose(1, 2)
+            vi = v[start:end].unsqueeze(0).transpose(1, 2)
+            oi = torch.nn.functional.scaled_dot_product_attention(
+                qi, ki, vi, is_causal=True, scale=self.scale
+            )
+            output[start:end] = oi.squeeze(0).transpose(0, 1)
+        return output
+
     # ----- Forward (fused attention) -----
 
     def forward(
@@ -680,6 +756,17 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
         if kv_cache.numel() == 0:
             self._norms_dirty = True
             return output.fill_(0)
+
+        # First-chunk prefill optimization: when all tokens are new
+        # (max_query_len == max_seq_len, no prior KV cache context),
+        # K/V are still in bf16. Use flash_attn directly — faster and
+        # lossless (no quantization noise on the prefill step).
+        is_pure_first_prefill = (
+            attn_metadata.max_query_len > 1
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+        )
+        if is_pure_first_prefill:
+            return self._flash_attn_prefill(query, key, value, attn_metadata, output)
 
         self._ensure_cache_views(kv_cache)
 
