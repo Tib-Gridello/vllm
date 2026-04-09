@@ -43,11 +43,11 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "turboquant": torch.uint8,
     # TurboQuant named presets (all stored as uint8).
-    # Common presets listed here; dynamic tq-* presets are handled
+    # Common presets listed here; dynamic tq_* presets are handled
     # by get_kv_cache_torch_dtype() below.
-    "tq-k8v8": torch.uint8,
-    "tq-k8fv4": torch.uint8,
-    "tq-k4v4": torch.uint8,
+    "tq_k8v8": torch.uint8,
+    "tq_k8fv4": torch.uint8,
+    "tq_k4v4": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -75,7 +75,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 
 
 def is_turboquant_kv_cache(kv_cache_dtype: str) -> bool:
-    return kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq-")
+    return kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq_")
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
@@ -270,7 +270,7 @@ def get_kv_cache_torch_dtype(
                 raise ValueError(f"Invalid model dtype: {model_dtype}")
         elif cache_dtype in STR_DTYPE_TO_TORCH_DTYPE:
             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
-        elif cache_dtype.startswith("tq-") or cache_dtype == "turboquant":
+        elif cache_dtype.startswith("tq_") or cache_dtype == "turboquant":
             # All TurboQuant presets use uint8 storage
             torch_dtype = torch.uint8
         else:

@@ -6,18 +6,18 @@ Named presets encode compression settings directly in the kv_cache_dtype
 string, following mgoin's request for "knobs to evaluate different
 compression levels."
 
-Preset format: tq-k{K}[f]v{V}[-qjl]
+Preset format: tq_k{K}[f]v{V}[_qjl]
   K = key bits (2-8)
   f = FP8 key mode (K stored as fp8_e4m3, V as TQ; requires K=8)
   V = value bits (2-8)
   qjl = sign correction enabled (opt-in, not recommended for attention)
 
 Recommended presets:
-  tq-k8v8      = 8-bit MSE-only (best quality, 2x compression, default)
-  tq-k8fv4     = FP8 keys + 4-bit TQ values (best quality/compression ratio)
-  tq-k4v4      = 4-bit MSE-only (4x compression)
+  tq_k8v8      = 8-bit MSE-only (best quality, 2x compression, default)
+  tq_k8fv4     = FP8 keys + 4-bit TQ values (best quality/compression ratio)
+  tq_k4v4      = 4-bit MSE-only (4x compression)
 
-QJL (-qjl suffix) adds 1-bit residual sign correction. The paper uses
+QJL (_qjl suffix) adds 1-bit residual sign correction. The paper uses
 Algorithm 1 (MSE-only) for KV cache, not Algorithm 2 (QJL). Community
 consensus: QJL adds variance that softmax amplifies, hurting quality.
 Use MSE-only with norm correction (enabled by default) instead.
@@ -102,18 +102,22 @@ class TQPreset:
 
 # Regex for parsing preset strings
 # 'f' after K bits = FP8 key mode
-_TQ_PATTERN = re.compile(r"^tq-k(\d+)(f?)v(\d+)(-qjl)?$")
+_TQ_PATTERN = re.compile(r"^tq_k(\d+)(f?)v(\d+)(_qjl)?$")
 
 
 # Backward compat: old "turboquant" string maps to best-quality preset.
 # Uses MSE-only (no QJL) — the paper's Algorithm 1 for KV cache.
 _TQ_ALIASES = {
-    "turboquant": "tq-k8v8",
+    "turboquant": "tq_k8v8",
+    # Backward compat: accept hyphens from older command lines
+    "tq-k8v8": "tq_k8v8",
+    "tq-k8fv4": "tq_k8fv4",
+    "tq-k4v4": "tq_k4v4",
 }
 
 
 def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
-    """Parse a tq-* string into a TQPreset.
+    """Parse a tq_* string into a TQPreset.
 
     Raises ValueError on invalid format.
     """
@@ -122,8 +126,8 @@ def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
     if not m:
         raise ValueError(
             f"Invalid TurboQuant preset: '{kv_cache_dtype}'. "
-            f"Expected format: tq-k{{K}}[f]v{{V}}[-qjl]. "
-            f"Examples: tq-k8v8, tq-k8fv4, tq-k4v4-qjl"
+            f"Expected format: tq_k{{K}}[f]v{{V}}[_qjl]. "
+            f"Examples: tq_k8v8, tq_k8fv4, tq_k4v4_qjl"
         )
     k_bits = int(m.group(1))
     k_fp8 = m.group(2) == "f"
@@ -147,6 +151,6 @@ def parse_tq_preset(kv_cache_dtype: str) -> TQPreset:
 
 
 def is_tq_preset(kv_cache_dtype: str) -> bool:
-    """Return True if kv_cache_dtype is a tq-* preset or 'turboquant' alias."""
+    """Return True if kv_cache_dtype is a tq_* preset or 'turboquant' alias."""
     kv_cache_dtype = _TQ_ALIASES.get(kv_cache_dtype, kv_cache_dtype)
     return bool(_TQ_PATTERN.match(kv_cache_dtype))

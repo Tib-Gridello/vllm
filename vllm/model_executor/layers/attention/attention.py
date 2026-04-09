@@ -563,7 +563,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 hasattr(self, "kv_cache_dtype")
                 and isinstance(self.kv_cache_dtype, str)
                 and (
-                    self.kv_cache_dtype.startswith("tq-")
+                    self.kv_cache_dtype.startswith("tq_")
                     or self.kv_cache_dtype == "turboquant"
                 )
             ):

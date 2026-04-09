@@ -18,9 +18,9 @@ Key design choices:
 - Named presets via --kv-cache-dtype
 
 Usage:
-  vllm serve <model> --kv-cache-dtype tq-k8v8      # 8-bit, 2x compression
-  vllm serve <model> --kv-cache-dtype tq-k4v4      # 4-bit, 4x compression
-  vllm serve <model> --kv-cache-dtype tq-k8v8-qjl  # with sign correction (opt-in)
+  vllm serve <model> --kv-cache-dtype tq_k8v8      # 8-bit, 2x compression
+  vllm serve <model> --kv-cache-dtype tq_k4v4      # 4-bit, 4x compression
+  vllm serve <model> --kv-cache-dtype tq_k8v8-qjl  # with sign correction (opt-in)
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
     Not compatible with: speculative decoding (validated in
     TurboQuantMetadataBuilder.__init__), encoder/encoder-decoder models.
 
-    For 4-bit presets (tq-k4v4, tq-k8fv4), use --kv-cache-dtype-skip-layers
+    For 4-bit presets (tq_k4v4, tq_k8fv4), use --kv-cache-dtype-skip-layers
     to keep the first/last layers in bf16 for quality.
     """
 
@@ -251,7 +251,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-        cache_dtype_str: str = "tq-k8v8-qjl",
+        cache_dtype_str: str = "tq_k8v8-qjl",
     ) -> tuple[int, ...]:
         """KV cache shape: (num_blocks, 2, block_size, num_kv_heads, padded_dim).
 

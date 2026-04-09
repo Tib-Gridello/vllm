@@ -83,10 +83,10 @@ def _get_backend_priorities(
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
-    # TurboQuant: short-circuit when kv_cache_dtype is a tq-* preset
+    # TurboQuant: short-circuit when kv_cache_dtype is a tq_* preset
     # or the legacy "turboquant" alias.
     if kv_cache_dtype is not None and (
-        kv_cache_dtype.startswith("tq-") or kv_cache_dtype == "turboquant"
+        kv_cache_dtype.startswith("tq_") or kv_cache_dtype == "turboquant"
     ):
         return [AttentionBackendEnum.TURBOQUANT]
 

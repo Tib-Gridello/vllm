@@ -306,23 +306,23 @@ class TestKVQuantMode:
         assert not mode.is_per_token_head
 
     def test_tq_nibble_preset(self):
-        """tq-k4v4 preset should map to TURBOQUANT (nibble mode)."""
+        """tq_k4v4 preset should map to TURBOQUANT (nibble mode)."""
         from vllm.v1.kv_cache_interface import (
             KVQuantMode,
             get_kv_quant_mode,
         )
 
-        mode = get_kv_quant_mode("tq-k4v4")
+        mode = get_kv_quant_mode("tq_k4v4")
         assert mode == KVQuantMode.TURBOQUANT
 
     def test_tq_byte_preset(self):
-        """tq-k8v8 preset should map to TURBOQUANT_BYTE."""
+        """tq_k8v8 preset should map to TURBOQUANT_BYTE."""
         from vllm.v1.kv_cache_interface import (
             KVQuantMode,
             get_kv_quant_mode,
         )
 
-        mode = get_kv_quant_mode("tq-k8v8")
+        mode = get_kv_quant_mode("tq_k8v8")
         assert mode == KVQuantMode.TURBOQUANT_BYTE
 
     def test_other_modes_unchanged(self):
@@ -1914,7 +1914,7 @@ class TestGPUKernelRoundtrip:
 
     @pytest.mark.parametrize(
         "preset",
-        ["tq-k8v8", "tq-k4v4", "tq-k8fv4"],
+        ["tq_k8v8", "tq_k4v4", "tq_k8fv4"],
     )
     def test_preset_cache_dimensions(self, preset: str):
         """Verify that each preset produces correct cache dimensions.

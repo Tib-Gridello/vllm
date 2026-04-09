@@ -64,7 +64,7 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq-"):
+    if kv_cache_dtype == "turboquant" or kv_cache_dtype.startswith("tq_"):
         from vllm.v1.attention.backends.turboquant_config import (
             parse_tq_preset,
         )

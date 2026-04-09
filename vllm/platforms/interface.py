@@ -517,8 +517,8 @@ class Platform:
         else:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(
                 cache_config.cache_dtype,
-                # TurboQuant presets (tq-*) all use uint8 storage
-                torch.uint8 if cache_config.cache_dtype.startswith("tq-") else None,
+                # TurboQuant presets (tq_*) all use uint8 storage
+                torch.uint8 if cache_config.cache_dtype.startswith("tq_") else None,
             )
             if kv_cache_dtype is None:
                 raise ValueError(f"Unknown cache dtype: {cache_config.cache_dtype}")

@@ -36,9 +36,9 @@ from vllm.v1.attention.backends.turboquant_config import parse_tq_preset
 # These are intentionally conservative; real-model quality is higher
 # because activations are structured (not random Gaussian).
 _THRESHOLD = {
-    "tq-k8v8": 0.98,
-    "tq-k8fv4": 0.99,
-    "tq-k4v4": 0.90,
+    "tq_k8v8": 0.98,
+    "tq_k8fv4": 0.99,
+    "tq_k4v4": 0.90,
 }
 
 
@@ -139,7 +139,7 @@ def _run_tq_attention_test(
     KV cache, runs fused attention, and compares against bf16 SDPA.
 
     Args:
-        preset_str: TQ preset name (e.g. "tq-k8v8").
+        preset_str: TQ preset name (e.g. "tq_k8v8").
         num_tokens: Number of new query tokens (decode step).
         context_len: Number of previously-cached context tokens.
         num_q_heads: Number of query heads.
@@ -302,7 +302,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Basic decode correctness --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k4v4", "tq-k8fv4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4", "tq_k8fv4"])
     @pytest.mark.parametrize("num_tokens", [1, 4, 16])
     @pytest.mark.parametrize("seq_len", [32, 128, 512])
     def test_decode_correctness(self, preset: str, num_tokens: int, seq_len: int):
@@ -326,7 +326,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- GQA --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
     def test_gqa(self, preset: str):
         """GQA: num_q_heads=32, num_kv_heads=8 (4x ratio)."""
         cos_sim = _run_tq_attention_test(
@@ -345,7 +345,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Head dim variants --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8"])
     @pytest.mark.parametrize("head_dim", [64, 128, 256])
     def test_head_dim_variants(self, preset: str, head_dim: int):
         """Different head dimensions (all power-of-2)."""
@@ -373,14 +373,14 @@ class TestTurboQuantAttentionCorrectness:
         rotated in FP8 key mode (K is in original space).
         """
         cos_sim = _run_tq_attention_test(
-            preset_str="tq-k8fv4",
+            preset_str="tq_k8fv4",
             num_tokens=4,
             context_len=128,
             num_q_heads=8,
             num_kv_heads=4,
             head_dim=128,
         )
-        threshold = _THRESHOLD["tq-k8fv4"]
+        threshold = _THRESHOLD["tq_k8fv4"]
         assert cos_sim > threshold, (
             f"FP8 key cosine similarity {cos_sim:.4f} below threshold {threshold}"
         )
@@ -388,21 +388,21 @@ class TestTurboQuantAttentionCorrectness:
     def test_fp8_key_gqa(self):
         """FP8 key mode with GQA (32 q heads, 8 kv heads)."""
         cos_sim = _run_tq_attention_test(
-            preset_str="tq-k8fv4",
+            preset_str="tq_k8fv4",
             num_tokens=4,
             context_len=128,
             num_q_heads=32,
             num_kv_heads=8,
             head_dim=128,
         )
-        threshold = _THRESHOLD["tq-k8fv4"]
+        threshold = _THRESHOLD["tq_k8fv4"]
         assert cos_sim > threshold, (
             f"FP8 key GQA cosine similarity {cos_sim:.4f} below threshold {threshold}"
         )
 
     # -- Numerical stability --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
     def test_numerical_stability_large_norms(self, preset: str):
         """Test with large-norm vectors (scaled up by 100x).
 
@@ -462,9 +462,9 @@ class TestTurboQuantAttentionCorrectness:
         # Large-norm inputs stress bf16 precision during attention;
         # use relaxed thresholds compared to standard tests.
         large_norm_threshold = {
-            "tq-k8v8": 0.95,
-            "tq-k8fv4": 0.95,
-            "tq-k4v4": 0.70,
+            "tq_k8v8": 0.95,
+            "tq_k8fv4": 0.95,
+            "tq_k4v4": 0.70,
         }
         threshold = large_norm_threshold[preset]
         assert cos_sim > threshold, (
@@ -472,7 +472,7 @@ class TestTurboQuantAttentionCorrectness:
             f"threshold {threshold} for preset={preset}"
         )
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
     def test_numerical_stability_small_norms(self, preset: str):
         """Test with near-zero vectors (scaled down by 1e-3).
 
@@ -539,7 +539,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Single-token decode (typical autoregressive) --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k8fv4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k8fv4"])
     def test_single_token_decode(self, preset: str):
         """Single-token decode: the most common inference scenario.
 
@@ -561,7 +561,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- Prefill-only (all tokens are new, no context) --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k4v4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k4v4"])
     def test_prefill_only(self, preset: str):
         """Prefill-only: context_len=0, all tokens are new.
 
@@ -584,7 +584,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- MHA (num_q_heads == num_kv_heads) --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8"])
     def test_mha(self, preset: str):
         """MHA: num_q_heads == num_kv_heads (no GQA)."""
         cos_sim = _run_tq_attention_test(
@@ -607,7 +607,7 @@ class TestTurboQuantAttentionCorrectness:
     def test_block_sizes(self, block_size: int):
         """Different KV cache block sizes."""
         cos_sim = _run_tq_attention_test(
-            preset_str="tq-k8v8",
+            preset_str="tq_k8v8",
             num_tokens=4,
             context_len=128,
             num_q_heads=8,
@@ -615,7 +615,7 @@ class TestTurboQuantAttentionCorrectness:
             head_dim=128,
             block_size=block_size,
         )
-        threshold = _THRESHOLD["tq-k8v8"]
+        threshold = _THRESHOLD["tq_k8v8"]
         assert cos_sim > threshold, (
             f"Block size {block_size} cosine similarity {cos_sim:.4f} "
             f"below threshold {threshold}"
@@ -623,7 +623,7 @@ class TestTurboQuantAttentionCorrectness:
 
     # -- CUDAGraph safety --
 
-    @pytest.mark.parametrize("preset", ["tq-k8v8", "tq-k8fv4"])
+    @pytest.mark.parametrize("preset", ["tq_k8v8", "tq_k8fv4"])
     def test_encode_cudagraph_safe(self, preset: str):
         """Verify encode kernels work inside CUDA graph capture/replay.
 

@@ -121,7 +121,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             dtype_str = self.cache_config.cache_dtype
             if dtype_str in STR_DTYPE_TO_TORCH_DTYPE:
                 self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[dtype_str]
-            elif dtype_str.startswith("tq-") or dtype_str == "turboquant":
+            elif dtype_str.startswith("tq_") or dtype_str == "turboquant":
                 self.kv_cache_dtype = torch.uint8
             else:
                 raise ValueError(f"Unknown cache dtype: {dtype_str}")
