@@ -374,6 +374,9 @@ def kv_cache_dtype_str_to_dtype(
     if kv_cache_dtype == "auto":
         # Model config may not be specified for unit tests, default to float16
         return model_config.dtype if model_config else torch.half
+    # TurboQuant presets (tq_*) store indices as uint8
+    if kv_cache_dtype.startswith("tq_") or kv_cache_dtype == "turboquant":
+        return torch.uint8
     return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
 
 
