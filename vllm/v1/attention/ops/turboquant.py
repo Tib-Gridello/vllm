@@ -332,7 +332,15 @@ class TurboQuantCodebook:
         gen = torch.Generator(device="cpu").manual_seed(seed)
         self.rotation_signs = (
             (
-                torch.randint(0, 2, (head_dim,), generator=gen, dtype=torch.float32) * 2
+                torch.randint(
+                    0,
+                    2,
+                    (head_dim,),
+                    generator=gen,
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                * 2
                 - 1
             )
             .contiguous()
