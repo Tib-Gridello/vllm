@@ -298,6 +298,16 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
       → inverse-rotate output
     """
 
+    # K and V use different rotation seeds to ensure their rotation
+    # matrices are statistically independent. This prevents correlated
+    # quantization errors between K and V from compounding during the
+    # dot-product attention computation (q · k_recon involves K's
+    # rotation, while output inverse-rotation involves V's rotation).
+    # The specific values are arbitrary but fixed for reproducibility
+    # across all instances and tensor-parallel ranks.
+    _K_ROTATION_SEED = 42
+    _V_ROTATION_SEED = 43
+
     # Per-instance cache views (point into each layer's KV cache)
     _k_norms: torch.Tensor | None = None
     _v_norms: torch.Tensor | None = None
@@ -364,7 +374,7 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._v_codebook = TurboQuantCodebook(
                 n_bits=self._preset.v_bits,
                 head_dim=head_size,
-                seed=43,
+                seed=self._V_ROTATION_SEED,
                 device="cpu",
                 qjl=self._preset.qjl,
             )
@@ -408,14 +418,14 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._k_codebook = TurboQuantCodebook(
                 n_bits=self._preset.k_bits,
                 head_dim=head_size,
-                seed=42,
+                seed=self._K_ROTATION_SEED,
                 device="cpu",
                 qjl=self._preset.qjl,
             )
             self._v_codebook = TurboQuantCodebook(
                 n_bits=self._preset.v_bits,
                 head_dim=head_size,
-                seed=43,
+                seed=self._V_ROTATION_SEED,
                 device="cpu",
                 qjl=self._preset.qjl,
             )
