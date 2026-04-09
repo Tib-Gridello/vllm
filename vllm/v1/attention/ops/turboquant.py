@@ -171,6 +171,72 @@ def _hadamard_matrix(d: int) -> torch.Tensor:
     return H[:d, :d] / math.sqrt(d)
 
 
+# ============================================================================
+# Fast Walsh-Hadamard Transform (FWHT)
+# ============================================================================
+
+
+def _fwht_inplace(x: torch.Tensor) -> torch.Tensor:
+    """In-place Fast Walsh-Hadamard Transform along the last dimension.
+
+    Computes ``H @ x / sqrt(d)`` in O(d log d) instead of O(d²).
+    The Hadamard matrix H is the same one produced by ``_hadamard_matrix``.
+
+    Args:
+        x: (..., d) tensor where d is a power of 2.
+    Returns:
+        x (modified in-place), divided by sqrt(d).
+    """
+    d = x.shape[-1]
+    h = 1
+    while h < d:
+        # Butterfly: for each pair of blocks of size h,
+        # (a, b) → (a + b, a - b)
+        x_view = x.view(*x.shape[:-1], d // (2 * h), 2, h)
+        a = x_view[..., 0, :].clone()
+        b = x_view[..., 1, :].clone()
+        x_view[..., 0, :] = a + b
+        x_view[..., 1, :] = a - b
+        h *= 2
+    x /= math.sqrt(d)
+    return x
+
+
+def hadamard_rotate(
+    x: torch.Tensor,
+    signs: torch.Tensor,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply randomized Hadamard rotation: R @ x = D @ H @ x.
+
+    Uses the O(d log d) Fast Walsh-Hadamard Transform instead of
+    O(d²) dense matmul. Mathematically identical to ``x @ R.T``
+    (forward) or ``x @ R`` (inverse), just 18x faster for d=128.
+
+    For forward rotation (encode K/V, rotate Q):
+        y = signs * FWHT(x)    = D @ H @ x
+    For inverse rotation (inverse-rotate output):
+        y = FWHT(signs * x)    = H @ D @ x = R^T @ x
+
+    Args:
+        x: (..., d) input tensor
+        signs: (d,) tensor of ±1 values
+        inverse: If True, apply R^T (inverse rotation)
+    Returns:
+        Rotated tensor, same shape as x.
+    """
+    y = x.clone()
+    if inverse:
+        # R^T = (D @ H)^T = H^T @ D^T = H @ D  (H is symmetric, D is diagonal)
+        y = y * signs
+        _fwht_inplace(y)
+    else:
+        # R = D @ H
+        _fwht_inplace(y)
+        y = y * signs
+    return y
+
+
 def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
     """Orthogonal rotation matrix for TurboQuant.
 
@@ -260,11 +326,25 @@ class TurboQuantCodebook:
         # Pre-transposed for fast matmul in encode/rotate
         self.rotation_matrix_T = R.T.contiguous().to(device)
 
+        # Signs for FWHT fast path (O(d log d) instead of O(d²) matmul).
+        # The rotation is R = D @ H where D = diag(signs), H = hadamard.
+        # Store signs separately so hadamard_rotate() can avoid matmul.
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        self.rotation_signs = (
+            (
+                torch.randint(0, 2, (head_dim,), generator=gen, dtype=torch.float32) * 2
+                - 1
+            )
+            .contiguous()
+            .to(device)
+        )
+
     def to(self, device) -> "TurboQuantCodebook":
         self.boundaries = self.boundaries.to(device)
         self.centroids = self.centroids.to(device)
         self.rotation_matrix = self.rotation_matrix.to(device)
         self.rotation_matrix_T = self.rotation_matrix_T.to(device)
+        self.rotation_signs = self.rotation_signs.to(device)
         return self
 
 
@@ -776,12 +856,24 @@ def turboquant_reshape_and_cache(
                 )
 
 
-def rotate_query(query: torch.Tensor, R_T: torch.Tensor) -> torch.Tensor:
-    """Rotate query by R: q_rot = q @ R^T (batch matmul).
+def rotate_query(
+    query: torch.Tensor,
+    R_T: torch.Tensor,
+    signs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Rotate query by R: q_rot = R @ q = D @ H @ q.
 
-    Uses query's dtype (bf16) directly — no float32 cast. Rotation
-    matrices should be pre-cast to the model dtype at init time.
+    When ``signs`` is provided, uses the O(d log d) Fast Walsh-Hadamard
+    Transform instead of O(d²) dense matmul (18x fewer FLOPs for d=128).
+    Mathematically identical — just faster.
+
+    Args:
+        query: (..., d) tensor
+        R_T: (d, d) rotation matrix transpose (fallback if signs is None)
+        signs: (d,) tensor of ±1 values for FWHT fast path
     """
+    if signs is not None:
+        return hadamard_rotate(query.float(), signs).to(query.dtype)
     shape = query.shape
     d = shape[-1]
     R_T = R_T.to(query.dtype)
@@ -791,11 +883,19 @@ def rotate_query(query: torch.Tensor, R_T: torch.Tensor) -> torch.Tensor:
 def inverse_rotate_output(
     output: torch.Tensor,
     R: torch.Tensor,
+    signs: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Inverse-rotate attention output: out @ R (batch matmul).
+    """Inverse-rotate attention output: R^T @ out = H @ D @ out.
 
-    Needed because V is in rotated space. Uses output's dtype directly.
+    When ``signs`` is provided, uses FWHT fast path.
+
+    Args:
+        output: (..., d) tensor
+        R: (d, d) rotation matrix (fallback if signs is None)
+        signs: (d,) tensor of ±1 values for FWHT fast path
     """
+    if signs is not None:
+        return hadamard_rotate(output.float(), signs, inverse=True).to(output.dtype)
     shape = output.shape
     d = shape[-1]
     R = R.to(output.dtype)
@@ -1607,7 +1707,6 @@ def turboquant_encode_single(
         return
 
     qjl = codebook.qjl
-    R_T = codebook.rotation_matrix_T
     n_heads = tensor.shape[1]
 
     # Process ALL tokens (no boolean filtering — CUDAGraph requires
@@ -1616,7 +1715,15 @@ def turboquant_encode_single(
     x = tensor.float()
     nrm = x.norm(dim=-1)
     x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
-    y = (x_hat.reshape(-1, x_hat.shape[-1]) @ R_T).reshape(x_hat.shape)
+
+    # Rotation: use O(d log d) FWHT when signs are available,
+    # falling back to O(d²) dense matmul for non-Hadamard rotations.
+    signs = getattr(codebook, "rotation_signs", None)
+    if signs is not None:
+        y = hadamard_rotate(x_hat, signs)
+    else:
+        R_T = codebook.rotation_matrix_T
+        y = (x_hat.reshape(-1, x_hat.shape[-1]) @ R_T).reshape(x_hat.shape)
 
     log2_levels = math.ceil(math.log2(max(codebook.n_levels, 2)))
 
