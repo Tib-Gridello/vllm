@@ -71,12 +71,18 @@ class TurboQuantMetadata(AttentionMetadata):
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
+    # Prefill/decode split (populated by reorder_batch_threshold)
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
+
     # 3D kernel parameters for parallel softmax segments (decode speedup)
-    seq_threshold_3D: int
-    num_par_softmax_segments: int
-    softmax_segm_output: torch.Tensor
-    softmax_segm_max: torch.Tensor
-    softmax_segm_expsum: torch.Tensor
+    seq_threshold_3D: int = 0
+    num_par_softmax_segments: int = 0
+    softmax_segm_output: torch.Tensor | None = None
+    softmax_segm_max: torch.Tensor | None = None
+    softmax_segm_expsum: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +176,10 @@ class TurboQuantMetadataBuilder(
             device=device,
         )
 
-    def reorder_batch(self, input_batch, scheduler_output) -> bool:
-        return False
+        # Enable prefill/decode batch reordering. Requests with
+        # query_len <= 1 (decode) are sorted to the front of the batch,
+        # enabling separate optimized code paths for each phase.
+        self._init_reorder_batch_threshold(1)
 
     def build(
         self,
@@ -179,6 +187,12 @@ class TurboQuantMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> TurboQuantMetadata:
+        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(common_attn_metadata, decode_threshold=1)
+        )
+
         return TurboQuantMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -187,6 +201,10 @@ class TurboQuantMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_tokens=num_prefill_tokens,
             seq_threshold_3D=self.seq_threshold_3D,
             num_par_softmax_segments=self.num_par_softmax_segments,
             softmax_segm_output=self.softmax_segm_output,
@@ -198,9 +216,27 @@ class TurboQuantMetadataBuilder(
         self,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> TurboQuantMetadata:
-        attn_metadata = self.build(0, common_attn_metadata, fast_build=True)
-        attn_metadata.seq_lens.fill_(1)
-        return attn_metadata
+        # CUDAGraph capture is always pure decode.
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        return TurboQuantMetadata(
+            num_actual_tokens=num_tokens,
+            max_query_len=1,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_decodes=num_reqs,
+            num_prefills=0,
+            num_decode_tokens=num_tokens,
+            num_prefill_tokens=0,
+            seq_threshold_3D=self.seq_threshold_3D,
+            num_par_softmax_segments=self.num_par_softmax_segments,
+            softmax_segm_output=self.softmax_segm_output,
+            softmax_segm_max=self.softmax_segm_max,
+            softmax_segm_expsum=self.softmax_segm_expsum,
+        )
 
 
 # ---------------------------------------------------------------------------
