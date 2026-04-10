@@ -166,12 +166,39 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        hs = self.head_size
-        # TurboQuant nibble mode (<=4 bit) packs 2 indices per byte,
-        # effectively halving the stored dimension.
+        # TurboQuant: page size depends on the preset's slot layout.
+        # Normally page_size_padded is set in get_kv_cache_spec() and
+        # this property is bypassed (see page_size_bytes above).  This
+        # branch is the fallback path for callers that construct an
+        # AttentionSpec directly without page_size_padded — they get
+        # the worst-case (8-bit byte mode) sizing for K and V plus a
+        # 4-byte float32 norm per slot.
+        #
+        # Per-mode K and V dimension stride (in bytes):
+        #   TURBOQUANT (mode 4):       K nibble (hs/2 + 4),  V nibble (hs/2 + 4)
+        #   TURBOQUANT_BYTE (mode 5):  K byte  (hs   + 4),   V byte  (hs   + 4)
+        #   TURBOQUANT_MIXED (mode 6): K byte  (hs   + 4),   V nibble (hs/2 + 4)
+        #   TURBOQUANT_FP8_KEY (m 7):  K fp8   (hs   + 4),   V nibble (hs/2 + 4)
         if self.kv_quant_mode == KVQuantMode.TURBOQUANT:
-            hs = hs // 2
-        return 2 * self.block_size * self.num_kv_heads * hs * get_dtype_size(self.dtype)
+            slot_per_head = (self.head_size // 2 + 4) * 2  # K + V
+            return self.block_size * self.num_kv_heads * slot_per_head
+        if self.kv_quant_mode == KVQuantMode.TURBOQUANT_BYTE:
+            slot_per_head = (self.head_size + 4) * 2
+            return self.block_size * self.num_kv_heads * slot_per_head
+        if self.kv_quant_mode in (
+            KVQuantMode.TURBOQUANT_MIXED,
+            KVQuantMode.TURBOQUANT_FP8_KEY,
+        ):
+            k_dim = self.head_size + 4  # byte K (or fp8 + scale)
+            v_dim = self.head_size // 2 + 4  # nibble V
+            return self.block_size * self.num_kv_heads * (k_dim + v_dim)
+        return (
+            2
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

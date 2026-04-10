@@ -684,8 +684,12 @@ def turboquant_reshape_and_cache(
         # 1. Compute norms (PyTorch)
         nrm = x.norm(dim=-1)  # (n_valid, num_heads)
 
-        # 2. Normalize to unit vectors (PyTorch)
-        x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
+        # 2. Normalize to unit vectors (PyTorch).  Clamp the norm to a
+        # floor instead of adding an epsilon: ``nrm + 1e-10`` distorts
+        # tiny norms by up to 100% (1e-12 / (1e-12 + 1e-10) ≈ 1%),
+        # while ``clamp(min=1e-10)`` only clamps the result to a unit
+        # vector when the input is genuinely zero.
+        x_hat = x / nrm.clamp(min=1e-10).unsqueeze(-1)
 
         # 3. Rotate: y = x_hat @ R^T (cuBLAS matmul — faster than einsum)
         orig_shape = x_hat.shape
@@ -1257,7 +1261,7 @@ def turboquant_encode_ref(
         squeeze = False
 
     norms = torch.norm(tensor.float(), dim=-1)
-    x_hat = tensor.float() / (norms.unsqueeze(-1) + 1e-10)
+    x_hat = tensor.float() / norms.clamp(min=1e-10).unsqueeze(-1)
     R = codebook.rotation_matrix.to(tensor.device)
     y = torch.einsum("...d,de->...e", x_hat, R.T)
 
@@ -1386,7 +1390,7 @@ def turboquant_encode_qjl_ref(
 
     device = tensor.device
     norms = torch.norm(tensor.float(), dim=-1)
-    x_hat = tensor.float() / (norms.unsqueeze(-1) + 1e-10)
+    x_hat = tensor.float() / norms.clamp(min=1e-10).unsqueeze(-1)
     R = codebook.rotation_matrix.to(device)
     y = torch.einsum("...d,de->...e", x_hat, R.T)
 
@@ -1615,7 +1619,9 @@ def turboquant_encode_single(
     # Triton kernel (slot < 0 → early return).
     x = tensor.float()
     nrm = x.norm(dim=-1)
-    x_hat = x / (nrm.unsqueeze(-1) + 1e-10)
+    # Clamp instead of add: nrm + epsilon distorts tiny norms; clamp
+    # only kicks in when the norm is genuinely below the floor.
+    x_hat = x / nrm.clamp(min=1e-10).unsqueeze(-1)
     y = (x_hat.reshape(-1, x_hat.shape[-1]) @ R_T).reshape(x_hat.shape)
 
     log2_levels = math.ceil(math.log2(max(codebook.n_levels, 2)))

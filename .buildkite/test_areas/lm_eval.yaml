@@ -11,6 +11,18 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-small.txt
 
+- label: LM Eval TurboQuant KV Cache
+  timeout_in_minutes: 90
+  optional: true
+  source_file_dependencies:
+  - vllm/v1/attention/backends/turboquant_attn.py
+  - vllm/v1/attention/backends/turboquant_config.py
+  - vllm/v1/attention/ops/turboquant.py
+  - vllm/v1/attention/ops/turboquant_tables.py
+  - vllm/v1/attention/ops/triton_unified_attention.py
+  commands:
+  - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-turboquant.txt
+
 # - label: LM Eval Large Models (4 GPUs)(A100)
 #   device: a100
 #   optional: true
