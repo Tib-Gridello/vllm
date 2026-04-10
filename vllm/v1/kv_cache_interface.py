@@ -170,9 +170,12 @@ class AttentionSpec(KVCacheSpec):
         # Normally page_size_padded is set in get_kv_cache_spec() and
         # this property is bypassed (see page_size_bytes above).  This
         # branch is the fallback path for callers that construct an
-        # AttentionSpec directly without page_size_padded — they get
-        # the worst-case (8-bit byte mode) sizing for K and V plus a
-        # 4-byte float32 norm per slot.
+        # AttentionSpec directly without page_size_padded.
+        #
+        # The cache shape is (num_blocks, 2, block_size, num_kv_heads,
+        # padded_dim) where padded_dim = max(k_dim, v_dim) (so both the
+        # K half and the V half have the SAME last-dim width, matching
+        # the standard leading-2 layout).
         #
         # Per-mode K and V dimension stride (in bytes):
         #   TURBOQUANT (mode 4):       K nibble (hs/2 + 4),  V nibble (hs/2 + 4)
@@ -180,18 +183,19 @@ class AttentionSpec(KVCacheSpec):
         #   TURBOQUANT_MIXED (mode 6): K byte  (hs   + 4),   V nibble (hs/2 + 4)
         #   TURBOQUANT_FP8_KEY (m 7):  K fp8   (hs   + 4),   V nibble (hs/2 + 4)
         if self.kv_quant_mode == KVQuantMode.TURBOQUANT:
-            slot_per_head = (self.head_size // 2 + 4) * 2  # K + V
-            return self.block_size * self.num_kv_heads * slot_per_head
+            padded = self.head_size // 2 + 4
+            return 2 * self.block_size * self.num_kv_heads * padded
         if self.kv_quant_mode == KVQuantMode.TURBOQUANT_BYTE:
-            slot_per_head = (self.head_size + 4) * 2
-            return self.block_size * self.num_kv_heads * slot_per_head
+            padded = self.head_size + 4
+            return 2 * self.block_size * self.num_kv_heads * padded
         if self.kv_quant_mode in (
             KVQuantMode.TURBOQUANT_MIXED,
             KVQuantMode.TURBOQUANT_FP8_KEY,
         ):
-            k_dim = self.head_size + 4  # byte K (or fp8 + scale)
-            v_dim = self.head_size // 2 + 4  # nibble V
-            return self.block_size * self.num_kv_heads * (k_dim + v_dim)
+            # Asymmetric: padded_dim = max(k_dim, v_dim), both halves
+            # use this padded size (standard leading-2 layout).
+            padded = self.head_size + 4  # byte K (or fp8 + scale) is larger
+            return 2 * self.block_size * self.num_kv_heads * padded
         return (
             2
             * self.block_size
