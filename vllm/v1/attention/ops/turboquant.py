@@ -454,9 +454,11 @@ def _turboquant_encode_packed_kernel(
 
     # Norm correction: centroid vector ||c[idx]|| != 1 after coordinate-wise
     # quantization. Dividing by ||c[idx]|| ensures the reconstructed vector
-    # has the correct magnitude.
+    # has the correct magnitude.  Clamp the computed norm to 1e-6 AFTER
+    # sqrt — adding epsilon inside sqrt would produce ~3e-7 from zero,
+    # amplifying tiny input noise.
     centroid_norm_sq = tl.sum(c_lo * c_lo, axis=0) + tl.sum(c_hi * c_hi, axis=0)
-    centroid_norm = tl.sqrt(centroid_norm_sq + 1e-12)
+    centroid_norm = tl.maximum(tl.sqrt(centroid_norm_sq), 1e-6)
     corrected_norm = norm / centroid_norm
 
     # Scatter corrected norm (float32 via strided view)
@@ -590,9 +592,10 @@ def _turboquant_encode_byte_kernel(
 
     # Norm correction: centroid vector ||c[idx]|| != 1 after coordinate-wise
     # quantization. Dividing by ||c[idx]|| ensures the reconstructed vector
-    # K = c[idx] * corrected_norm has ||K|| == original ||K||.
+    # K = c[idx] * corrected_norm has ||K|| == original ||K||.  Clamp the
+    # computed norm to 1e-6 AFTER sqrt (see nibble kernel comment).
     centroid_norm_sq = tl.sum(centroid_vals * centroid_vals, axis=0)
-    centroid_norm = tl.sqrt(centroid_norm_sq + 1e-12)
+    centroid_norm = tl.maximum(tl.sqrt(centroid_norm_sq), 1e-6)
     corrected_norm = norm / centroid_norm
 
     # Scatter corrected norm (float32 via strided view)
@@ -1274,7 +1277,7 @@ def turboquant_encode_ref(
     centroids = codebook.centroids.to(tensor.device)
     centroid_vals = centroids[indices.long()]  # (..., head_dim)
     centroid_norms = torch.norm(centroid_vals.float(), dim=-1)  # (...,)
-    corrected_norms = norms / (centroid_norms + 1e-12)
+    corrected_norms = norms / centroid_norms.clamp(min=1e-6)
 
     if packed and not codebook.byte_mode:
         indices = pack_nibbles(indices)
@@ -1407,7 +1410,7 @@ def turboquant_encode_qjl_ref(
     # Norm correction: centroid vector is NOT unit norm after coordinate-wise
     # quantization. Correcting ensures ||K_recon|| == original ||K||.
     centroid_norms = torch.norm(centroid_vals.float(), dim=-1)
-    corrected_norms = norms / (centroid_norms + 1e-12)
+    corrected_norms = norms / centroid_norms.clamp(min=1e-6)
 
     # sign(r) and mean(|r|)
     sign_raw = residual >= 0

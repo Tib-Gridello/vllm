@@ -779,14 +779,24 @@ class TurboQuantAttentionImpl(AttentionImpl[TurboQuantMetadata]):
             self._norms_dirty = True
             return output.fill_(0)
 
+        # Defensive early-return for empty batches.  Without this, the
+        # Triton kernel would launch with an empty Q tensor and a
+        # potentially non-zero grid, which is undefined behaviour.
+        if num_actual_tokens == 0:
+            return output
+
         # First-chunk prefill optimization: when all tokens are new
         # (max_query_len == max_seq_len, no prior KV cache context),
-        # K/V are still in bf16. Use flash_attn directly — faster and
-        # lossless (no quantization noise on the prefill step).
-        is_pure_first_prefill = (
-            attn_metadata.max_query_len > 1
-            and attn_metadata.max_query_len == attn_metadata.max_seq_len
-        )
+        # K/V are still in bf16.  Use flash_attn directly on the raw
+        # bf16 inputs instead of reading the TQ-compressed cache.  This
+        # is strictly better quality (no quantization noise) and also
+        # faster (no dequant work in the attention kernel).
+        #
+        # Note: this works for any max_query_len (including 1), because
+        # do_kv_cache_update has already scattered the new K/V into the
+        # cache, and the condition ``max_query_len == max_seq_len``
+        # guarantees there is no older context to attend to.
+        is_pure_first_prefill = attn_metadata.max_query_len == attn_metadata.max_seq_len
         if is_pure_first_prefill:
             return self._flash_attn_prefill(query, key, value, attn_metadata, output)
 
