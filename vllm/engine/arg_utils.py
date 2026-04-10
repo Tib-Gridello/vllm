@@ -1591,6 +1591,8 @@ class EngineArgs:
 
         # Auto-compute boundary skip layers for TurboQuant low-bit
         # presets if the user did not specify them manually.
+        # Skipped for hybrid models (attention + mamba) because mixed
+        # page sizes would break the required page-size unification.
         if (
             resolved_cache_dtype is not None
             and (
@@ -1598,6 +1600,7 @@ class EngineArgs:
                 or resolved_cache_dtype == "turboquant"
             )
             and not self.kv_cache_dtype_skip_layers
+            and not model_config.is_hybrid
         ):
             from vllm.v1.attention.backends.turboquant_config import (
                 get_boundary_skip_layers,
@@ -1612,6 +1615,19 @@ class EngineArgs:
                     "(override with --kv-cache-dtype-skip-layers)",
                     auto_skip,
                 )
+        elif (
+            resolved_cache_dtype is not None
+            and (
+                resolved_cache_dtype.startswith("tq_")
+                or resolved_cache_dtype == "turboquant"
+            )
+            and model_config.is_hybrid
+        ):
+            logger.warning(
+                "TurboQuant on hybrid models (attention + mamba): "
+                "boundary layer auto-skip disabled. Quality may "
+                "degrade at 4-bit or lower."
+            )
 
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]

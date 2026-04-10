@@ -316,6 +316,11 @@ class Attention(nn.Module, AttentionLayerBase):
         self.use_alibi_sqrt = bool(use_alibi_sqrt)
         if backend_supports_alibi_sqrt:
             extra_impl_args["use_alibi_sqrt"] = self.use_alibi_sqrt
+        # TurboQuant needs the layer name to derive per-layer rotation
+        # seeds (otherwise all layers use identical rotations and
+        # quantization errors are perfectly correlated across layers).
+        if self.attn_backend.get_name() == "TURBOQUANT":
+            extra_impl_args["layer_name"] = prefix
         # prefix caching + batch invariance is currently not supported for
         # FLASHINFER and TRITON_MLA.
         if (
